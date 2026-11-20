@@ -1,0 +1,44 @@
+Đang phát S4 (ACC, BVP, EDA, HR, TEMP) tới localhost:9092, topic=wearable.sensor.v1, source=pickle, speed=60.0x, offset=300s, duration=40s
+Pickle wrist không có kênh: HR; bỏ qua các kênh này.
+Đã gửi 100 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:40.937Z
+Đã gửi 200 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:41.906Z
+Đã gửi 300 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:42.859Z
+Đã gửi 400 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:43.812Z
+Đã gửi 500 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:44.781Z
+Đã gửi 600 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:45.750Z
+Đã gửi 700 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:46.718Z
+Đã gửi 800 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:47.671Z
+Đã gửi 900 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:48.625Z
+Đã gửi 1,000 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:49.593Z
+Đã gửi 1,100 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:50.546Z
+Đã gửi 1,200 mẫu; mẫu mới nhất: TEMP @ 2017-06-13T08:38:51.500Z
+Đã gửi 1,300 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:52.484Z
+Đã gửi 1,400 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:53.437Z
+Đã gửi 1,500 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:54.406Z
+Đã gửi 1,600 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:55.359Z
+Đã gửi 1,700 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:56.312Z
+Đã gửi 1,800 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:57.281Z
+Đã gửi 1,900 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:38:58.250Z
+Đã gửi 2,000 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:38:59.218Z
+Đã gửi 2,100 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:00.171Z
+Đã gửi 2,200 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:01.125Z
+Đã gửi 2,300 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:39:02.093Z
+Đã gửi 2,400 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:03.046Z
+Đã gửi 2,500 mẫu; mẫu mới nhất: TEMP @ 2017-06-13T08:39:04.000Z
+Đã gửi 2,600 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:04.984Z
+Đã gửi 2,700 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:05.937Z
+Đã gửi 2,800 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:39:06.906Z
+Đã gửi 2,900 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:07.859Z
+Đã gửi 3,000 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:08.812Z
+Đã gửi 3,100 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:39:09.781Z
+Đã gửi 3,200 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:10.750Z
+Đã gửi 3,300 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:39:11.718Z
+Đã gửi 3,400 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:12.671Z
+Đã gửi 3,500 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:13.625Z
+Đã gửi 3,600 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:39:14.593Z
+Đã gửi 3,700 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:15.546Z
+Đã gửi 3,800 mẫu; mẫu mới nhất: TEMP @ 2017-06-13T08:39:16.500Z
+Đã gửi 3,900 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:17.484Z
+Đã gửi 4,000 mẫu; mẫu mới nhất: BVP @ 2017-06-13T08:39:18.437Z
+Đã gửi 4,100 mẫu; mẫu mới nhất: ACC @ 2017-06-13T08:39:19.406Z
+Hoàn tất: đã gửi 4,160 mẫu vào topic wearable.sensor.v1.

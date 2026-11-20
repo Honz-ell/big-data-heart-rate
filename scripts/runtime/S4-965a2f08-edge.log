@@ -1,0 +1,4 @@
+Model Edge đã cập nhật: version=v1.0.0, file=v1.0.0.joblib
+Edge simulator S4 đang đọc wearable.sensor.v1 từ localhost:9092; cửa sổ=30s. Nhấn Ctrl+C để dừng.
+S4 | 2017-06-13T08:38:40+00:00 – 2017-06-13T08:39:10+00:00 | prediction=NON_STRESS | model_score_stress=0.420 | samples=ACC:960,BVP:1920,EDA:120,TEMP:120
+  ↳ Đã lưu cửa sổ dự đoán vào PostgreSQL.

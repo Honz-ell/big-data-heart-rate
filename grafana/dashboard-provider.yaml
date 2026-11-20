@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: WESAD Monitoring
+    orgId: 1
+    folder: WESAD
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

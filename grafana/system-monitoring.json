@@ -1,0 +1,124 @@
+{
+  "id": null,
+  "uid": "wesad-system-monitoring",
+  "title": "WESAD · System Monitoring",
+  "tags": ["wesad", "kafka", "spark", "prometheus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Kafka messages in · records/sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "sum(rate(kafka_server_messagesinpersec_total{topic=\"wearable.sensor.v1\"}[1m]))", "legendFormat": "wearable.sensor.v1", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 2,
+      "title": "Kafka traffic · bytes/sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "sum(rate(kafka_server_bytesinpersec_total{topic=\"wearable.sensor.v1\"}[1m]))", "legendFormat": "bytes in", "refId": "A" },
+        { "expr": "sum(rate(kafka_server_bytesoutpersec_total{topic=\"wearable.sensor.v1\"}[1m]))", "legendFormat": "bytes out", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 3,
+      "title": "Spark input and processing rate · records/sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "wesad_spark_input_records_per_second", "legendFormat": "input", "refId": "A" },
+        { "expr": "wesad_spark_processed_records_per_second", "legendFormat": "processed", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 4,
+      "title": "Spark micro-batch execution time",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "wesad_spark_trigger_execution_ms", "legendFormat": "trigger execution", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 5,
+      "title": "Spark records in latest micro-batch",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "wesad_spark_records_in_batch", "legendFormat": "records", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 16 },
+      "options": { "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" }, "orientation": "auto", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto" }
+    },
+    {
+      "id": 6,
+      "title": "Kafka request latency · p95 ms",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "kafka_network_request_latency_ms{quantile=\"0.95\"}", "legendFormat": "{{request}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 18, "x": 6, "y": 16 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 7,
+      "title": "Container CPU · percent of one core",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\".*wesad-(kafka|postgres|grafana|model-registry|spark).*\"}[1m])) * 100", "legendFormat": "{{name}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 21 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 8,
+      "title": "Container memory working set",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "container_memory_working_set_bytes{name=~\".*wesad-(kafka|postgres|grafana|model-registry|spark).*\"}", "legendFormat": "{{name}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 21 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 9,
+      "title": "Monitoring target status",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "wesad-prometheus" },
+      "targets": [
+        { "expr": "up{job=~\"kafka-jmx|spark|cadvisor\"}", "legendFormat": "{{job}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bool" }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 29 },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    }
+  ]
+}

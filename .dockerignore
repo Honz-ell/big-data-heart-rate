@@ -1,0 +1,15 @@
+.git
+.venv
+.venv3
+node_modules
+.next
+__pycache__
+**/__pycache__
+scripts/runtime
+checkpoints
+models
+data
+archive
+*.pkl
+*.csv
+*.joblib

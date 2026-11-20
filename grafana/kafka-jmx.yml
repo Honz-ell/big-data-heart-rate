@@ -1,0 +1,44 @@
+hostPort: kafka:9999
+lowercaseOutputName: true
+rules:
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec, topic=(.+)><>Count'
+    name: kafka_server_messagesinpersec_total
+    help: Kafka messages received, cumulative count.
+    labels:
+      topic: "$1"
+    type: COUNTER
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec><>Count'
+    name: kafka_server_messagesinpersec_total
+    help: Kafka messages received across all topics, cumulative count.
+    type: COUNTER
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec), topic=(.+)><>Count'
+    name: kafka_server_$1_total
+    help: Kafka bytes transferred, cumulative count.
+    labels:
+      topic: "$2"
+    type: COUNTER
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec)><>Count'
+    name: kafka_server_$1_total
+    help: Kafka bytes transferred across all topics, cumulative count.
+    type: COUNTER
+  - pattern: 'kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(Produce|FetchConsumer)><>95thPercentile'
+    name: kafka_network_request_latency_ms
+    help: Kafka produce/fetch request latency at the 95th percentile, milliseconds.
+    labels:
+      request: "$1"
+      quantile: "0.95"
+    type: GAUGE
+  - pattern: 'kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(Produce|FetchConsumer)><>Mean'
+    name: kafka_network_request_latency_mean_ms
+    help: Kafka produce/fetch mean request latency, milliseconds.
+    labels:
+      request: "$1"
+    type: GAUGE
+  - pattern: 'kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value'
+    name: kafka_server_under_replicated_partitions
+    help: Number of under-replicated Kafka partitions.
+    type: GAUGE
+  - pattern: 'kafka.controller<type=KafkaController, name=ActiveControllerCount><>Value'
+    name: kafka_controller_active_controller_count
+    help: Number of active Kafka controllers on this node.
+    type: GAUGE
