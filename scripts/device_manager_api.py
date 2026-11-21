@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -24,6 +24,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from wesad.demo_simulator import SCENARIO_CATALOG, generate_scenario_windows  # noqa: E402
+from wesad.pickle_reader import recording_origin_epoch  # noqa: E402
 from wesad.vitals import classify_activity  # noqa: E402
 
 DATA_ROOT = Path(os.getenv("WESAD_DATA_ROOT", r"D:\btldll\archive\WESAD"))
@@ -435,6 +436,8 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             python, "-u", str(PROJECT_ROOT / "scripts" / "produce_e4.py"),
             "--data", str(DATA_ROOT),
             "--subject", subject_id,
+            # Keep model features on the pickle scale used during training.
+            # The pickle reader joins the original E4 HR/IBI CSV channels.
             "--source", "pickle",
             "--speed", str(request.speed),
             "--start-offset-seconds", str(request.start_offset_seconds),
@@ -589,7 +592,7 @@ def _backfill_legacy_vitals(
     activity_state, acc_g = classify_activity(est_acc_std)
 
     rf_score = float(pred["model_score_stress"])
-    stress_load = int(round(min(98.0, max(6.0, rf_score * 86.0 + (10.0 if rf_score >= 0.5 else 4.0)))))
+    stress_load = int(round(min(1.0, max(0.0, rf_score)) * 100.0))
     reason_label = (
         "Tổ hợp tín hiệu cổ tay vượt ngưỡng căng thẳng"
         if pred["prediction"] == "STRESS"
@@ -597,8 +600,8 @@ def _backfill_legacy_vitals(
     )
     return {
         "hr_bpm": hr_bpm,
-        "baseline_hr_bpm": 73.0,
-        "hr_delta_bpm": round(hr_bpm - 73.0, 1) if hr_bpm is not None else None,
+        "baseline_hr_bpm": None,
+        "hr_delta_bpm": None,
         "hrv_rmssd_ms": None,
         "eda_mean_us": eda_us,
         "eda_std_us": None,
@@ -607,13 +610,13 @@ def _backfill_legacy_vitals(
         "activity_state": activity_state,
         "heart_anomaly": "NONE",
         "stress_load": stress_load,
-        "signal_quality": 1.0,
+        "signal_quality": None,
         "reason_codes": [
             {
                 "code": "RF_SCORE",
                 "severity": "high" if pred["prediction"] == "STRESS" else "low",
                 "label": reason_label,
-                "detail": f"Điểm xác suất mô hình Random Forest đạt {rf_score:.1%}.",
+                "detail": f"Điểm mô hình Random Forest đạt {rf_score:.1%}; không phải xác suất chẩn đoán.",
             }
         ],
     }
@@ -656,8 +659,12 @@ def _build_clinical_summary(
         if latest_spark.get("hr_bpm") is not None
         else latest_vit.get("hr_bpm")
     )
-    baseline_hr = latest_vit.get("baseline_hr_bpm") or 73.0
-    hr_delta = round(float(latest_hr) - float(baseline_hr), 1) if latest_hr is not None else None
+    baseline_hr = latest_vit.get("baseline_hr_bpm")
+    hr_delta = (
+        round(float(latest_hr) - float(baseline_hr), 1)
+        if latest_hr is not None and baseline_hr is not None
+        else None
+    )
     latest_eda = (
         latest_spark.get("eda_us")
         if latest_spark.get("eda_us") is not None
@@ -709,49 +716,40 @@ def _build_clinical_summary(
 
     activity_state = str(latest_vit.get("activity_state") or "RESTING")
     heart_anomaly = str(latest_vit.get("heart_anomaly") or "NONE")
+    status = "CALM"
 
     if activity_state == "HIGH_ACTIVITY":
         status = "PHYSICAL_ACTIVITY"
-        headline = "Đang vận động thể chất — Nhịp tim tăng sinh lý tự nhiên"
-        recommendation = (
-            "Gia tốc cổ tay ghi nhận vận động liên tục. Hệ thống tự động loại trừ cảnh báo stress giả; "
-            "hãy duy trì nhịp thở đều và bổ sung nước sau khi vận động."
-        )
-    elif streak >= 3 or (streak >= 2 and heart_anomaly == "TACHYCARDIA_AT_REST"):
+        headline = "ACC ghi nhận mức vận động cao"
+        recommendation = "Đây là thông tin bối cảnh vận động; kết quả Stress/Non-Stress bên dưới vẫn là dự đoán riêng của mô hình."
+    if streak >= 3:
         status = "SUSTAINED_STRESS"
-        headline = f"Cảnh báo căng thẳng kéo dài ({streak * 30} giây liên tục)"
+        headline = f"Mô hình dự đoán Stress liên tiếp trong {streak * 30} giây"
         recommendation = (
-            "Nhịp tim lúc nghỉ tăng cao kèm giảm HRV và tăng dẫn điện da qua nhiều cửa sổ liên tiếp. "
-            "Khuyến nghị: tạm rời màn hình 2 phút, thả lỏng vai và thực hiện 6 nhịp thở sâu (hít 4s – giữ 4s – thở ra 6s)."
+            "Đây là kết quả phân loại trên dữ liệu WESAD phát lại, không phải cảnh báo y tế. "
+            "Có thể mở biểu đồ để xem điểm mô hình và các cảm biến trong từng cửa sổ."
         )
-    elif streak >= 1 or heart_anomaly == "TACHYCARDIA_AT_REST":
+    elif streak >= 1:
         status = "ATTENTION"
-        headline = "Phát hiện phản ứng căng thẳng mới xuất hiện — Đang theo dõi"
+        headline = "Mô hình vừa dự đoán Stress — đang chờ các cửa sổ tiếp theo"
         recommendation = (
-            "Hệ thống mới ghi nhận 1–2 cửa sổ tăng kích thích giao cảm (30–60 giây). "
-            "Chưa phát báo động khẩn để tránh nhiễu tức thời; hãy thả lỏng nhịp thở."
+            "Một vài cửa sổ chưa đủ để kết luận xu hướng kéo dài. Xem đây là kết quả mô hình trên dữ liệu phát lại."
         )
-    else:
+    elif status != "PHYSICAL_ACTIVITY":
         status = "CALM"
         if recovery_seconds is not None:
-            headline = f"Cơ thể đã hồi phục cân bằng sau {recovery_seconds} giây"
-            recommendation = (
-                "Nhịp tim, HRV và độ dẫn điện da đã quay về vùng nghỉ ổn định sau pha áp lực. "
-                "Có thể tiếp tục công việc tập trung."
-            )
+            headline = f"Mô hình trở lại Non-Stress sau khoảng {recovery_seconds} giây"
+            recommendation = "Đây là thời gian giữa các nhãn dự đoán, không khẳng định cơ thể đã hồi phục sinh lý."
         else:
-            headline = "Trạng thái sinh lý ổn định & thư giãn"
-            recommendation = (
-                "Nhịp tim và biến thiên nhịp tim (HRV) nằm trong ngưỡng nghỉ cá nhân. "
-                "Hệ thần kinh tự chủ đang cân bằng tốt."
-            )
+            headline = "Mô hình đang dự đoán Non-Stress"
+            recommendation = "Kết quả chỉ mô tả phân loại của mô hình trên dữ liệu WESAD, không phải đánh giá sức khỏe."
 
     return {
         "status": status,
         "headline": headline,
         "recommendation": recommendation,
         "latest_hr_bpm": latest_hr,
-        "baseline_hr_bpm": round(float(baseline_hr), 1),
+        "baseline_hr_bpm": round(float(baseline_hr), 1) if baseline_hr is not None else None,
         "hr_delta_bpm": hr_delta,
         "latest_hrv_rmssd_ms": latest_vit.get("hrv_rmssd_ms"),
         "latest_eda_us": latest_eda,
@@ -828,36 +826,104 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
             "spark_series": spark_points[-(limit * 3) :],
         }
 
+    # For a real replay, event timestamps remain the original WESAD recording
+    # timestamps (2017). Scope the dashboard to the most recently launched
+    # replay's offset so replaying an earlier segment is visible immediately.
+    replay_bounds: tuple[datetime, datetime] | None = None
+    replay_created_after: datetime | None = None
+    with sessions_lock:
+        current_session = sessions.get(subject_id)
+        if current_session and not current_session.get("is_demo"):
+            offset = float(current_session.get("start_offset_seconds", 0))
+            duration = float(current_session.get("duration_seconds", 0))
+            created_at = current_session.get("created_at")
+            if created_at:
+                replay_created_after = datetime.fromisoformat(
+                    str(created_at).replace("Z", "+00:00")
+                )
+            subject_dir = DATA_ROOT / subject_id
+            if duration > 0 and (subject_dir / f"{subject_id}.pkl").is_file():
+                try:
+                    origin_epoch = recording_origin_epoch(
+                        subject_dir, ("ACC", "BVP", "EDA", "TEMP")
+                    )
+                    replay_start = datetime.fromtimestamp(
+                        origin_epoch + offset, timezone.utc
+                    )
+                    replay_bounds = (replay_start, replay_start + timedelta(seconds=duration))
+                except (OSError, ValueError):
+                    replay_bounds = None
+
     try:
         with db_connect() as connection:
             ensure_db_extensions(connection)
-            pred_rows = connection.execute(
-                """
-                SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
-                       p.model_score_stress, p.model_file, p.model_version,
-                       p.sample_counts, p.vitals,
-                       f.verdict AS feedback_verdict, f.note AS feedback_note
-                FROM stress_predictions p
-                LEFT JOIN prediction_feedback f
-                  ON f.subject_id = p.subject_id AND f.window_start = p.window_start
-                WHERE p.subject_id = %s
-                ORDER BY p.window_start DESC
-                LIMIT %s
-                """,
-                (subject_id, limit),
-            ).fetchall()
+            if replay_bounds:
+                replay_start, replay_end = replay_bounds
+                pred_rows = connection.execute(
+                    """
+                    SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
+                           p.model_score_stress, p.model_file, p.model_version,
+                           p.sample_counts, p.vitals,
+                           f.verdict AS feedback_verdict, f.note AS feedback_note
+                    FROM stress_predictions p
+                    LEFT JOIN prediction_feedback f
+                      ON f.subject_id = p.subject_id AND f.window_start = p.window_start
+                    WHERE p.subject_id = %s
+                      AND p.window_start >= %s AND p.window_start < %s
+                      AND p.created_at >= %s
+                    ORDER BY p.window_start DESC
+                    LIMIT %s
+                    """,
+                    (subject_id, replay_start, replay_end, replay_created_after or replay_start, limit),
+                ).fetchall()
 
-            spark_raw = connection.execute(
-                """
-                SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
-                       sample_count, mean_value, min_value, max_value, spark_batch_id
-                FROM sensor_window_aggregates
-                WHERE subject_id = %s
-                ORDER BY window_start_utc DESC
-                LIMIT %s
-                """,
-                (subject_id, limit * 18),
-            ).fetchall()
+                spark_raw = connection.execute(
+                    """
+                    SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
+                           sample_count, mean_value, min_value, max_value, spark_batch_id
+                    FROM sensor_window_aggregates
+                    WHERE subject_id = %s
+                      AND window_start_utc < %s AND window_end_utc > %s
+                      AND ingested_at >= %s
+                    ORDER BY window_start_utc DESC
+                    LIMIT %s
+                    """,
+                    (
+                        subject_id,
+                        replay_end,
+                        replay_start,
+                        replay_created_after or replay_start,
+                        limit * 18,
+                    ),
+                ).fetchall()
+            else:
+                pred_rows = connection.execute(
+                    """
+                    SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
+                           p.model_score_stress, p.model_file, p.model_version,
+                           p.sample_counts, p.vitals,
+                           f.verdict AS feedback_verdict, f.note AS feedback_note
+                    FROM stress_predictions p
+                    LEFT JOIN prediction_feedback f
+                      ON f.subject_id = p.subject_id AND f.window_start = p.window_start
+                    WHERE p.subject_id = %s
+                    ORDER BY p.window_start DESC
+                    LIMIT %s
+                    """,
+                    (subject_id, limit),
+                ).fetchall()
+
+                spark_raw = connection.execute(
+                    """
+                    SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
+                           sample_count, mean_value, min_value, max_value, spark_batch_id
+                    FROM sensor_window_aggregates
+                    WHERE subject_id = %s
+                    ORDER BY window_start_utc DESC
+                    LIMIT %s
+                    """,
+                    (subject_id, limit * 18),
+                ).fetchall()
     except psycopg.Error as error:
         raise HTTPException(
             status_code=503,
@@ -886,15 +952,27 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
         item["vitals"] = _backfill_legacy_vitals(item, spark_points)
         preds_chrono.append(item)
 
+    # The database is persistent across app restarts. Keep the newest continuous
+    # replay segment so unrelated runs do not get squeezed onto one timeline.
+    if len(preds_chrono) > 1:
+        latest_run = [preds_chrono[-1]]
+        for item in reversed(preds_chrono[:-1]):
+            next_start = datetime.fromisoformat(_iso_utc(latest_run[0]["window_start"]))
+            item_end = datetime.fromisoformat(_iso_utc(item["window_end"]))
+            gap_seconds = (next_start - item_end).total_seconds()
+            if gap_seconds > 60:
+                break
+            latest_run.insert(0, item)
+        preds_chrono = latest_run
+
     # Filter Spark 10s points to match the active time span around predictions if predictions exist
-    if preds_chrono and spark_points:
+    if preds_chrono:
         min_start = preds_chrono[0]["window_start"]
         max_end = preds_chrono[-1]["window_end"]
         aligned_spark = [
             pt for pt in spark_points if pt["window_end_utc"] > min_start and pt["window_start_utc"] < max_end
         ]
-        if aligned_spark:
-            spark_points = aligned_spark
+        spark_points = aligned_spark
 
     # Fill missing 10s HR from overlapping 30s Edge vitals if older replays lacked HR channel
     for pt in spark_points:

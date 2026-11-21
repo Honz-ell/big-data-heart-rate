@@ -202,7 +202,7 @@ def summarize_window_vitals(
     baseline_hr_bpm: float | None = None,
     baseline_eda_us: float | None = None,
 ) -> dict[str, Any]:
-    """Build user-meaningful physiological vitals, anomaly flags, composite score, and Vietnamese reason codes."""
+    """Summarize measured E4 channels and the model score without health diagnosis claims."""
     # Feature order in wesad.features.FEATURE_NAMES:
     # 0..3: acc_mean, acc_std, acc_min, acc_max
     # 4..7: bvp_mean, bvp_std, bvp_min, bvp_max
@@ -215,150 +215,60 @@ def summarize_window_vitals(
 
     activity_state, acc_activity_g = classify_activity(acc_std_raw)
 
-    # Extract HR & HRV from 64 Hz BVP samples (or fallback to explicit HR samples if present)
-    bvp_list = window_samples.get("BVP") or []
-    pulse = estimate_pulse_from_bvp(np.asarray(bvp_list, dtype=np.float64), sample_rate_hz=64.0)
-    hr_bpm = pulse["hr_bpm"]
-    if hr_bpm is None and window_samples.get("HR"):
-        hr_arr = np.asarray(window_samples["HR"], dtype=np.float64)
-        hr_arr = hr_arr[np.isfinite(hr_arr)]
-        if hr_arr.size > 0:
-            hr_bpm = round(float(np.mean(hr_arr)), 1)
+    # Prefer the Empatica E4's recorded HR channel. Compute RMSSD only from
+    # actual IBI intervals; do not present an unvalidated BVP peak estimate as HRV.
+    hr_values = np.asarray(window_samples.get("HR") or [], dtype=np.float64).reshape(-1)
+    hr_values = hr_values[np.isfinite(hr_values) & (hr_values >= 35.0) & (hr_values <= 210.0)]
+    hr_bpm = round(float(np.median(hr_values)), 1) if hr_values.size else None
 
-    hrv_rmssd_ms = pulse["hrv_rmssd_ms"]
-    signal_quality = float(pulse["signal_quality"] or 0.0)
-
-    ref_hr = float(baseline_hr_bpm) if baseline_hr_bpm is not None else 73.0
-    hr_delta_bpm = round(float(hr_bpm) - ref_hr, 1) if hr_bpm is not None else None
-
-    ref_eda = float(baseline_eda_us) if (baseline_eda_us is not None and baseline_eda_us > 0.05) else 0.85
-    eda_ratio = round(eda_mean_us / ref_eda, 2) if ref_eda > 0 else 1.0
-
-    # Heart-rate anomaly classification contextualized by physical motion
-    heart_anomaly = "NONE"
-    if hr_bpm is not None:
-        if activity_state == "HIGH_ACTIVITY" and hr_bpm >= 98.0:
-            heart_anomaly = "ELEVATED_WITH_MOTION"
-        elif activity_state == "RESTING" and (
-            hr_bpm >= 100.0 or (hr_delta_bpm is not None and hr_delta_bpm >= 18.0)
-        ):
-            heart_anomaly = "TACHYCARDIA_AT_REST"
-        elif hr_bpm < 48.0:
-            heart_anomaly = "BRADYCARDIA"
-        elif (
-            activity_state != "HIGH_ACTIVITY"
-            and hrv_rmssd_ms is not None
-            and hrv_rmssd_ms < 22.0
-            and model_score_stress >= 0.5
-        ):
-            heart_anomaly = "LOW_HRV_STRAIN"
-
-    # Composite physiological stress load (0 - 100) for intuitive user comprehension
-    raw_load = float(model_score_stress) * 68.0
-    if hr_delta_bpm is not None and activity_state != "HIGH_ACTIVITY":
-        raw_load += float(np.clip(hr_delta_bpm / 28.0, -0.15, 1.0)) * 18.0
-    if hrv_rmssd_ms is not None and activity_state != "HIGH_ACTIVITY":
-        raw_load += float(np.clip((42.0 - float(hrv_rmssd_ms)) / 30.0, 0.0, 1.0)) * 8.0
-    if eda_std_us >= 0.035:
-        raw_load += min(6.0, (eda_std_us / 0.07) * 6.0)
-    if activity_state == "HIGH_ACTIVITY":
-        # Suppress false psychological stress score during brisk physical motion
-        raw_load = min(raw_load * 0.55, 46.0)
-
-    stress_load = int(round(float(np.clip(raw_load, 4.0, 99.0))))
-
-    reason_codes: list[dict[str, str]] = []
-    if activity_state == "HIGH_ACTIVITY":
-        reason_codes.append(
-            {
-                "code": "MOTION_CONTEXT",
-                "severity": "info",
-                "label": "Đang vận động thể chất",
-                "detail": (
-                    f"Gia tốc cổ tay động ở mức cao ({acc_activity_g:.3f} g). "
-                    "Nhịp tim/mồ hôi tăng là đáp ứng sinh lý tự nhiên khi vận động, không kết luận stress tâm lý."
-                ),
-            }
-        )
-    else:
-        if heart_anomaly == "TACHYCARDIA_AT_REST" and hr_bpm is not None:
-            delta_txt = f" ({hr_delta_bpm:+.0f} BPM so với mức nền)" if hr_delta_bpm is not None else ""
-            reason_codes.append(
-                {
-                    "code": "RESTING_HR_SURGE",
-                    "severity": "high",
-                    "label": "Nhịp tim tăng bất thường khi ngồi tĩnh",
-                    "detail": f"Nhịp tim đạt {hr_bpm:.0f} BPM{delta_txt} trong khi cơ thể gần như không vận động ({acc_activity_g:.3f} g).",
-                }
-            )
-        elif hr_bpm is not None and hr_delta_bpm is not None and hr_delta_bpm >= 10.0:
-            reason_codes.append(
-                {
-                    "code": "HR_ELEVATED",
-                    "severity": "medium",
-                    "label": "Nhịp tim cao hơn mức nghỉ cá nhân",
-                    "detail": f"Nhịp tim {hr_bpm:.0f} BPM ({hr_delta_bpm:+.0f} BPM so với nền {ref_hr:.0f} BPM).",
-                }
-            )
-
-        if hrv_rmssd_ms is not None and hrv_rmssd_ms < 26.0:
-            reason_codes.append(
-                {
-                    "code": "HRV_SUPPRESSED",
-                    "severity": "medium" if hrv_rmssd_ms >= 18.0 else "high",
-                    "label": "Biến thiên nhịp tim (HRV) giảm thấp",
-                    "detail": f"RMSSD còn {hrv_rmssd_ms:.0f} ms — dấu hiệu hệ thần kinh giao cảm đang căng, khả năng thư giãn giảm.",
-                }
-            )
-
-        if eda_std_us >= 0.038 or eda_mean_us >= 2.8:
-            reason_codes.append(
-                {
-                    "code": "EDA_SYMPATHETIC_SURGE",
-                    "severity": "high" if eda_std_us >= 0.065 else "medium",
-                    "label": "Tăng dẫn điện da (phản ứng mồ hôi vi thể)",
-                    "detail": (
-                        f"EDA trung bình {eda_mean_us:.2f} µS (biến thiên {eda_std_us:.3f} µS, gấp {eda_ratio:.1f}× mức nền) "
-                        "— tín hiệu đặc trưng nhất của mô hình Random Forest."
-                    ),
-                }
-            )
-
-        if heart_anomaly == "BRADYCARDIA" and hr_bpm is not None:
-            reason_codes.append(
-                {
-                    "code": "LOW_RESTING_HR",
-                    "severity": "medium",
-                    "label": "Nhịp tim thấp",
-                    "detail": f"Nhịp tim ghi nhận {hr_bpm:.0f} BPM (< 48 BPM), cần kiểm tra độ ôm của vòng đeo cổ tay.",
-                }
-            )
-
-    if not reason_codes:
-        if model_score_stress >= 0.5:
-            reason_codes.append(
-                {
-                    "code": "RF_MULTIVARIATE_PATTERN",
-                    "severity": "medium",
-                    "label": "Tổ hợp tín hiệu sinh lý vượt ngưỡng mô hình",
-                    "detail": f"Mô hình Random Forest chấm {model_score_stress:.0%} dựa trên tương quan BVP, EDA và nhiệt độ da ({temp_mean_c:.1f} °C).",
-                }
-            )
+    ibi_values: list[float] = []
+    for sample in window_samples.get("IBI") or []:
+        if isinstance(sample, dict):
+            value = sample.get("interval")
         else:
-            hr_txt = f"{hr_bpm:.0f} BPM" if hr_bpm is not None else "ổn định"
-            hrv_txt = f", HRV {hrv_rmssd_ms:.0f} ms" if hrv_rmssd_ms is not None else ""
-            reason_codes.append(
-                {
-                    "code": "AUTONOMIC_CALM",
-                    "severity": "low",
-                    "label": "Chỉ số sinh tồn cân bằng",
-                    "detail": f"Nhịp tim {hr_txt}{hrv_txt}, dẫn điện da {eda_mean_us:.2f} µS và nhiệt độ cổ tay {temp_mean_c:.1f} °C ổn định.",
-                }
-            )
+            value = sample
+        try:
+            interval = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(interval) and 0.30 <= interval <= 2.00:
+            ibi_values.append(interval)
+    ibi = np.asarray(ibi_values, dtype=np.float64)
+    hrv_rmssd_ms = (
+        round(float(np.sqrt(np.mean(np.square(np.diff(ibi)))) * 1000.0), 1)
+        if ibi.size >= 4
+        else None
+    )
+    ibi_total = len(window_samples.get("IBI") or [])
+    signal_quality = round(float(ibi.size) / ibi_total, 3) if ibi_total else None
+
+    ref_hr = float(baseline_hr_bpm) if baseline_hr_bpm is not None else None
+    hr_delta_bpm = (
+        round(float(hr_bpm) - ref_hr, 1)
+        if hr_bpm is not None and ref_hr is not None
+        else None
+    )
+
+    # This is a rescaled Random Forest output, not a calibrated health/stress scale.
+    stress_load = int(round(float(np.clip(model_score_stress, 0.0, 1.0)) * 100.0))
+    heart_anomaly = "NONE"
+    reason_codes: list[dict[str, str]] = [{
+        "code": "MODEL_STRESS" if model_score_stress >= 0.5 else "MODEL_NON_STRESS",
+        "severity": "medium" if model_score_stress >= 0.5 else "low",
+        "label": "Mô hình dự đoán Stress" if model_score_stress >= 0.5 else "Mô hình dự đoán Non-Stress",
+        "detail": f"Điểm mô hình Random Forest: {model_score_stress:.1%}; ACC hiển thị riêng làm bối cảnh vận động.",
+    }]
+    if activity_state == "HIGH_ACTIVITY":
+        reason_codes.append({
+            "code": "MOTION_CONTEXT",
+            "severity": "info",
+            "label": "ACC cho thấy vận động mạnh",
+            "detail": f"Độ lệch chuẩn ACC quy đổi khoảng {acc_activity_g:.3f} g; đây là ngữ cảnh, không ghi đè dự đoán mô hình.",
+        })
 
     return {
         "hr_bpm": hr_bpm,
-        "baseline_hr_bpm": round(ref_hr, 1),
+        "baseline_hr_bpm": round(ref_hr, 1) if ref_hr is not None else None,
         "hr_delta_bpm": hr_delta_bpm,
         "hrv_rmssd_ms": hrv_rmssd_ms,
         "eda_mean_us": eda_mean_us,

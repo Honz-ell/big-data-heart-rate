@@ -11,9 +11,8 @@ from typing import Iterator
 
 import numpy as np
 
-from wesad.e4_reader import UNITS
+from wesad.e4_reader import UNITS, iter_sensor_samples
 from wesad.features import SAMPLE_RATES_HZ
-from wesad.vitals import derive_hr_stream_from_bvp
 
 
 def recording_origin_epoch(subject_dir: Path, sensors: tuple[str, ...]) -> float:
@@ -57,15 +56,19 @@ def iter_pickle_sensor_samples(
         sensor for sensor in sensors
         if sensor in SAMPLE_RATES_HZ and sensor in wrist_by_name
     )
-    wants_hr = "HR" in sensors and "BVP" in wrist_by_name
+    e4_dir = subject_dir / f"{subject_dir.name}_E4_Data"
+    csv_channels = tuple(
+        sensor for sensor in ("HR", "IBI")
+        if sensor in sensors and (e4_dir / f"{sensor}.csv").is_file()
+    )
     missing = [
         sensor
         for sensor in sensors
-        if sensor not in available and not (sensor == "HR" and wants_hr)
+        if sensor not in available and sensor not in csv_channels
     ]
     if missing:
         print(f"Pickle wrist không có kênh: {', '.join(missing)}; bỏ qua các kênh này.")
-    if not available and not wants_hr:
+    if not available and not csv_channels:
         raise ValueError(f"Không có kênh wrist phù hợp trong {pkl_path}")
 
     origin_sensors = available if available else ("BVP",)
@@ -101,39 +104,19 @@ def iter_pickle_sensor_samples(
                 "value": value,
             }
 
-    def derived_hr_stream() -> Iterator[dict[str, object]]:
-        bvp_all = np.asarray(wrist_by_name["BVP"], dtype=np.float64).reshape(-1)
-        bvp_rate = float(SAMPLE_RATES_HZ["BVP"])
-        lookback_sec = 8.0
-        slice_start_sec = max(0.0, start_sec - lookback_sec)
-        s_idx = int(slice_start_sec * bvp_rate)
-        e_idx = bvp_all.size if end_sec is None else min(bvp_all.size, int(np.ceil(end_sec * bvp_rate)))
-        hr_points = derive_hr_stream_from_bvp(
-            bvp_all[s_idx:e_idx],
-            sample_rate_hz=bvp_rate,
-            window_seconds=lookback_sec,
-            step_seconds=1.0,
-        )
-        for rel_offset_sec, hr_bpm in hr_points:
-            abs_offset_sec = slice_start_sec + rel_offset_sec
-            if abs_offset_sec < start_sec:
+    def csv_channel_stream(sensor: str) -> Iterator[dict[str, object]]:
+        path = e4_dir / f"{sensor}.csv"
+        for record in iter_sensor_samples(path, subject_dir.name, sensor):
+            event_epoch = datetime.fromisoformat(
+                str(record["timestamp"]).replace("Z", "+00:00")
+            ).timestamp()
+            offset = event_epoch - origin_epoch
+            if offset < start_sec:
                 continue
-            if end_sec is not None and abs_offset_sec >= end_sec:
+            if end_sec is not None and offset >= end_sec:
                 break
-            hr_index = int(round(abs_offset_sec))
-            timestamp = datetime.fromtimestamp(
-                origin_epoch + abs_offset_sec, timezone.utc
-            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-            yield {
-                "subject_id": subject_dir.name,
-                "timestamp": timestamp,
-                "sensor": "HR",
-                "unit": UNITS["HR"],
-                "sample_index": hr_index,
-                "value": float(hr_bpm),
-            }
+            yield record
 
     streams: list[Iterator[dict[str, object]]] = [sensor_stream(sensor) for sensor in available]
-    if wants_hr:
-        streams.append(derived_hr_stream())
+    streams.extend(csv_channel_stream(sensor) for sensor in csv_channels)
     yield from merge(*streams, key=lambda record: str(record["timestamp"]))

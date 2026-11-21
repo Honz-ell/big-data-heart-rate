@@ -21,10 +21,9 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 180,
         "speed": 30,
         "description": (
-            "Pha đọc báo / làm việc nhẹ lúc đầu phiên đo WESAD: cơ thể ngồi tĩnh, "
-            "nhịp tim ~70–74 BPM, HRV cao và dẫn điện da (EDA) phẳng."
+            "Phát lại đoạn baseline của participant S4 trong WESAD; xem các kênh cảm biến và kết quả mô hình."
         ),
-        "expected_outcome": "Không phát cảnh báo · Chỉ số căng thẳng thấp (< 30/100)",
+        "expected_outcome": "Đối chiếu dự đoán Non-Stress với nhãn baseline của dữ liệu.",
     },
     {
         "id": "tsst_acute_stress",
@@ -36,10 +35,9 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 180,
         "speed": 30,
         "description": (
-            "Bài kiểm tra Trier Social Stress Test (phỏng vấn & trừ nhẩm trước hội đồng): "
-            "người đeo ngồi/đứng tĩnh nhưng nhịp tim vọt > 100 BPM, HRV tụt sâu và EDA tăng vọt."
+            "Phát lại đoạn TSST được gắn nhãn Stress của participant S4; các chỉ số hiển thị lấy từ file cảm biến gốc."
         ),
-        "expected_outcome": "Cảnh báo căng thẳng kéo dài sau ≥ 3 cửa sổ (90s) + gợi ý hít thở",
+        "expected_outcome": "Quan sát dự đoán theo cửa sổ và so sánh với nhãn Stress trong WESAD.",
     },
     {
         "id": "stress_to_recovery",
@@ -51,14 +49,13 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 240,
         "speed": 40,
         "description": (
-            "Theo dõi 4 phút từ cuối bài áp lực sang giai đoạn nghỉ thư giãn: "
-            "quan sát nhịp tim hạ dần, HRV phục hồi và cảnh báo tự động giải tỏa."
+            "Phát lại đoạn chuyển tiếp trong recording S4; nhãn và chỉ số phản ánh dữ liệu được ghi nhận, không cam kết xu hướng sinh lý cụ thể."
         ),
-        "expected_outcome": "Đo được thời gian hồi phục (Recovery Time) sau đỉnh stress",
+        "expected_outcome": "Quan sát thời điểm dự đoán của mô hình chuyển từ Stress sang Non-Stress.",
     },
     {
         "id": "physical_activity_check",
-        "title": "Đi bộ nhanh / Leo cầu thang (Chống báo giả)",
+        "title": "Đoạn có gia tốc cổ tay dao động",
         "badge": "Vận động",
         "tone": "motion",
         "subject_id": "S4",
@@ -66,10 +63,9 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 180,
         "speed": 30,
         "description": (
-            "Nhịp tim tăng lên 118–128 BPM kèm gia tốc cổ tay (ACC) dao động lớn: "
-            "minh họa cách đa cảm biến phân biệt tập thể dục với căng thẳng tâm lý lúc nghỉ."
+            "Quan sát ACC trong đoạn dữ liệu được chọn; không gán hoạt động cụ thể nếu nhãn hoạt động không có trong WESAD."
         ),
-        "expected_outcome": "Gắn nhãn 'Đang vận động' · Không báo động nhầm nhịp tim bất thường",
+        "expected_outcome": "Đối chiếu ACC với dự đoán Stress/Non-Stress; ACC không ghi đè nhãn mô hình.",
     },
 ]
 

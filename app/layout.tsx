@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "WESAD Pulse & Stress Companion — Giám sát Nhịp tim & Căng thẳng Đa cảm biến",
+  title: "WESAD Stress Lab — Phân tích dữ liệu cảm biến đeo",
   description:
-    "Hệ thống phân tích luồng dữ liệu đeo tay Empatica E4: theo dõi nhịp tim (BPM), HRV, dẫn điện da (EDA), phát hiện căng thẳng kéo dài và vận hành mô hình Edge AI với Apache Kafka & Spark Structured Streaming.",
+    "Mô phỏng phát lại dữ liệu WESAD qua Kafka và Spark, phân loại Stress/Non-Stress và trực quan hóa tín hiệu HR, IBI, EDA, nhiệt độ và gia tốc. Không phải công cụ chẩn đoán sức khỏe.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

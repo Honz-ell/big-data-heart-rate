@@ -167,7 +167,7 @@ function fmtAnomalyVi(code: string): { label: string; cls: string } {
     case "BRADYCARDIA":
       return { label: "Nhịp tim thấp (< 48 BPM)", cls: "pill pill-warn" };
     default:
-      return { label: "Nhịp tim bình thường", cls: "pill pill-calm" };
+      return { label: "Không đánh giá bệnh lý", cls: "pill" };
   }
 }
 
@@ -312,6 +312,7 @@ export default function HomePage() {
     setBusyAction(spec.scenario_id ?? "custom");
     setErrorBanner(null);
     setSelectedWindowKey(null);
+    setTimeline(null);
     setOffsetSeconds(spec.start_offset_seconds);
     setDurationSeconds(spec.duration_seconds);
     setSpeed(spec.speed);
@@ -417,7 +418,7 @@ export default function HomePage() {
       <header className="topbar">
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <h1 className="brand-title">WESAD Pulse &amp; Stress Companion</h1>
+            <h1 className="brand-title">WESAD Stress Lab</h1>
             <span className={backendMode === "live_stack" ? "pill pill-calm" : "pill pill-motion"}>
               <span
                 className="live-dot"
@@ -426,12 +427,12 @@ export default function HomePage() {
                 }}
               />
               {backendMode === "live_stack"
-                ? "Cụm Live: Kafka · Spark · PostgreSQL"
+                ? "Pipeline: Kafka · Spark · PostgreSQL"
                 : "Chế độ Trình diễn Trực tiếp (Real RF + Mô phỏng E4)"}
             </span>
           </div>
           <p className="brand-sub">
-            Theo dõi nhịp tim (BPM), biến thiên nhịp tim (HRV), phản ứng mồ hôi da (EDA) và phát hiện căng thẳng kéo dài theo thời gian thực
+            Phát lại cảm biến WESAD qua Kafka và Spark; xem HR/HRV từ kênh E4, tín hiệu EDA và dự đoán Stress/Non-Stress của mô hình.
           </p>
         </div>
 
@@ -462,7 +463,7 @@ export default function HomePage() {
               className={`tab-btn ${activeTab === "user" ? "active" : ""}`}
               onClick={() => setActiveTab("user")}
             >
-              Theo dõi Sức khỏe &amp; Cảnh báo
+              Phân tích Stress trên dữ liệu WESAD
             </button>
             <button
               type="button"
@@ -667,7 +668,7 @@ export default function HomePage() {
                           ? "THEO DÕI SỚM"
                           : summary.status === "PHYSICAL_ACTIVITY"
                             ? "BỐI CẢNH VẬN ĐỘNG"
-                            : "CÂN BẰNG SINH LÝ"}
+                            : "MÔ HÌNH: NON-STRESS"}
                     </span>
                     {summary.consecutive_stress_seconds > 0 && (
                       <span style={{ fontSize: 12, color: "var(--muted)" }}>
@@ -677,7 +678,7 @@ export default function HomePage() {
                     )}
                     {summary.recovery_seconds !== null && (
                       <span className="pill pill-calm">
-                        Thời gian hồi phục: {summary.recovery_seconds} giây
+                        Thời gian đến khi mô hình trở lại Non-Stress: {summary.recovery_seconds} giây
                       </span>
                     )}
                   </div>
@@ -724,7 +725,7 @@ export default function HomePage() {
                       {breathPhase.title} — còn {breathPhase.remain}s
                     </div>
                     <div style={{ fontSize: 12.5, color: "var(--muted)", marginTop: 3 }}>
-                      Chu kỳ 14 giây (~4.3 nhịp/phút) kích hoạt dây thần kinh phế vị, giúp tăng chỉ số HRV (RMSSD) và đưa nhịp tim lúc nghỉ về mức nền sau 60–90 giây.
+                      Bài thở hướng dẫn thư giãn minh họa; hệ thống không đo hay đảm bảo tác động lên nhịp tim hoặc HRV.
                     </div>
                   </div>
                 </div>
@@ -766,12 +767,12 @@ export default function HomePage() {
                     }}
                   >
                     {summary.hr_delta_bpm >= 0 ? `+${summary.hr_delta_bpm.toFixed(0)}` : summary.hr_delta_bpm.toFixed(0)}{" "}
-                    BPM vs nền ({summary.baseline_hr_bpm?.toFixed(0) ?? 73})
+                    BPM so với mốc tham chiếu trong phiên ({summary.baseline_hr_bpm?.toFixed(0) ?? "—"})
                   </span>
                 )}
               </div>
               <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8 }}>
-                Nguồn: Sóng mạch quang học BVP 64 Hz &amp; luồng tổng hợp Spark 10s
+                Nguồn: Kênh HR Empatica E4, tổng hợp theo cửa sổ Spark 10 giây
               </div>
             </div>
 
@@ -782,19 +783,11 @@ export default function HomePage() {
                   BIẾN THIÊN NHỊP TIM (HRV)
                 </span>
                 <span
-                  className={
-                    (summary?.latest_hrv_rmssd_ms ?? 35) < 22
-                      ? "pill pill-stress"
-                      : (summary?.latest_hrv_rmssd_ms ?? 35) < 30
-                        ? "pill pill-warn"
-                        : "pill pill-calm"
-                  }
+                  className="pill"
                 >
-                  {(summary?.latest_hrv_rmssd_ms ?? 35) < 22
-                    ? "Giao cảm căng"
-                    : (summary?.latest_hrv_rmssd_ms ?? 35) < 30
-                      ? "Trung bình"
-                      : "Phục hồi tốt"}
+                  {summary?.latest_hrv_rmssd_ms == null
+                    ? "Chưa đủ dữ liệu"
+                    : "Tính từ IBI E4"}
                 </span>
               </div>
               <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 10 }}>
@@ -806,7 +799,7 @@ export default function HomePage() {
                 <span style={{ fontSize: 14, color: "var(--muted)" }}>ms (RMSSD)</span>
               </div>
               <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8 }}>
-                HRV cao (&gt; 30 ms) biểu thị thư giãn; tụt thấp (&lt; 22 ms) báo hiệu cơ thể đang căng thẳng
+                RMSSD được tính từ IBI E4 trong cửa sổ này; không dùng riêng HRV để kết luận stress hay sức khỏe.
               </div>
             </div>
 
@@ -814,7 +807,7 @@ export default function HomePage() {
             <div className="card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600 }}>
-                  CHỈ SỐ CĂNG THẲNG (0–100)
+                  ĐIỂM MÔ HÌNH (0–100)
                 </span>
                 <span style={{ fontSize: 12, color: "var(--muted)" }}>
                   AI RF:{" "}
@@ -842,7 +835,7 @@ export default function HomePage() {
                 </span>
                 <span style={{ fontSize: 14, color: "var(--muted)" }}>/ 100</span>
                 <span style={{ marginLeft: "auto", fontSize: 12, color: "var(--muted)" }}>
-                  Tỷ lệ stress phiên: <strong>{summary?.stress_ratio_pct ?? 0}%</strong>
+                  Tỷ lệ cửa sổ dự đoán Stress: <strong>{summary?.stress_ratio_pct ?? 0}%</strong>
                 </span>
               </div>
               <div
@@ -907,7 +900,7 @@ export default function HomePage() {
                 </div>
               </div>
               <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>
-                Cửa sổ bất thường nhịp tim: <strong>{summary?.anomaly_windows_count ?? 0}</strong> · Spark 10s:{" "}
+                Cửa sổ dự đoán: <strong>{predictions.length}</strong> · Spark 10s:{" "}
                 <strong>{summary?.spark_windows_count ?? 0}</strong> điểm
               </div>
             </div>
@@ -960,7 +953,7 @@ export default function HomePage() {
               predictions={predictions}
               sparkSeries={sparkSeries}
               metric={chartMetric}
-              baselineHr={summary?.baseline_hr_bpm ?? 72}
+              baselineHr={summary?.baseline_hr_bpm ?? null}
               selectedWindowStart={selectedWindow?.window_start ?? null}
               onSelectWindow={(ws) => setSelectedWindowKey(ws)}
             />
@@ -1604,7 +1597,7 @@ function DualTimelineChart({
   predictions: PredictionWindow[];
   sparkSeries: SparkPoint[];
   metric: ChartMetric;
-  baselineHr: number;
+  baselineHr: number | null;
   selectedWindowStart: string | null;
   onSelectWindow: (windowStart: string) => void;
 }) {
@@ -1688,7 +1681,8 @@ function DualTimelineChart({
   let lineColor = "#5eead4";
 
   if (metric === "hr") {
-    const vals = points.map((p) => p.v).concat([baselineHr]);
+    const vals = points.map((p) => p.v);
+    if (baselineHr !== null) vals.push(baselineHr);
     yMin = Math.floor(Math.min(58, ...vals) - 4);
     yMax = Math.ceil(Math.max(115, ...vals) + 6);
     unit = "BPM";
@@ -1748,6 +1742,7 @@ function DualTimelineChart({
               style={{ cursor: "pointer" }}
               onClick={() => onSelectWindow(pred.window_start)}
             >
+              <title>{`${fmtClock(pred.window_start)} · ${isStress ? "STRESS" : "NON-STRESS"} · điểm mô hình ${(pred.model_score_stress * 100).toFixed(1)}/100`}</title>
               <rect
                 x={x1}
                 y={padT}
@@ -1757,16 +1752,6 @@ function DualTimelineChart({
                 stroke={isSel ? "#edf4f1" : "rgba(255,255,255,0.06)"}
                 strokeWidth={isSel ? 1.5 : 0.6}
               />
-              <text
-                x={x1 + w / 2}
-                y={padT + 13}
-                textAnchor="middle"
-                fill={isStress ? "#ff9c90" : isMotion ? "#8fd0ff" : "#7fd8c5"}
-                fontSize={9.5}
-                fontWeight={700}
-              >
-                {isStress ? "STRESS" : isMotion ? "VẬN ĐỘNG" : "ỔN ĐỊNH"}
-              </text>
             </g>
           );
         })}
@@ -1797,8 +1782,8 @@ function DualTimelineChart({
           );
         })}
 
-        {/* Personal Baseline HR Reference Line */}
-        {metric === "hr" && (
+        {/* Session reference HR line (estimated from qualifying calm windows) */}
+        {metric === "hr" && baselineHr !== null && (
           <g>
             <line
               x1={padL}
@@ -1816,7 +1801,7 @@ function DualTimelineChart({
               fill="#f6cb72"
               fontSize={10}
             >
-              Mức nền nghỉ ({baselineHr.toFixed(0)} BPM)
+              Mốc tham chiếu phiên ({baselineHr.toFixed(0)} BPM)
             </text>
           </g>
         )}
@@ -1847,21 +1832,20 @@ function DualTimelineChart({
           </circle>
         ))}
 
-        {/* X-axis timestamps */}
-        {predictions.map((pred, idx) => {
-          if (predictions.length > 8 && idx % 2 !== 0 && idx !== predictions.length - 1) {
-            return null;
-          }
-          const x = xOf(new Date(pred.window_start).getTime());
+        {/* Fixed number of evenly spaced x-axis timestamps to avoid label collisions */}
+        {Array.from({ length: 6 }, (_, idx) => {
+          const tickTime = minT + ((maxT - minT) * idx) / 5;
+          const x = xOf(tickTime);
           return (
             <text
-              key={`lbl-${pred.window_start}`}
-              x={x + 2}
+              key={`tick-${idx}`}
+              x={x}
               y={height - 10}
               fill="#93a7a0"
               fontSize={10.5}
+              textAnchor={idx === 0 ? "start" : idx === 5 ? "end" : "middle"}
             >
-              {fmtClock(pred.window_start)}
+              {fmtClock(new Date(tickTime).toISOString())}
             </text>
           );
         })}

@@ -293,11 +293,9 @@ def main() -> int:
             baseline_hr_bpm = cur_hr if baseline_hr_bpm is None else (0.75 * baseline_hr_bpm + 0.25 * cur_hr)
             baseline_eda_us = cur_eda if baseline_eda_us is None else (0.75 * baseline_eda_us + 0.25 * cur_eda)
 
-        prediction = (
-            "NON_STRESS"
-            if vitals["activity_state"] == "HIGH_ACTIVITY"
-            else ("STRESS" if stress_probability >= 0.5 else "NON_STRESS")
-        )
+        # Keep the classifier's output intact. ACC is shown as context, not used
+        # as an unvalidated post-processing rule that can reverse the prediction.
+        prediction = "STRESS" if stress_probability >= 0.5 else "NON_STRESS"
         assert origin is not None
         window_start = origin + timedelta(seconds=window_index * window_seconds)
         window_end = window_start + timedelta(seconds=window_seconds)
@@ -373,7 +371,7 @@ def main() -> int:
                     if event.get("subject_id") != args.subject:
                         continue
                     sensor = event.get("sensor")
-                    if sensor not in SAMPLE_RATES_HZ and sensor != "HR":
+                    if sensor not in SAMPLE_RATES_HZ and sensor not in {"HR", "IBI"}:
                         continue
                     event_time = to_datetime(event["timestamp"])
                     if origin is None or active_window is None:

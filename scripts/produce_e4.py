@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         "--sensors",
         nargs="+",
         choices=SENSORS,
-        default=["ACC", "BVP", "EDA", "HR", "TEMP"],
+        default=["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"],
     )
     parser.add_argument("--broker", default="localhost:9092")
     parser.add_argument("--topic", default="wearable.sensor.v1")
