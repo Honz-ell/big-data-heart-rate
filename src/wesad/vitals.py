@@ -221,26 +221,41 @@ def summarize_window_vitals(
     hr_values = hr_values[np.isfinite(hr_values) & (hr_values >= 35.0) & (hr_values <= 210.0)]
     hr_bpm = round(float(np.median(hr_values)), 1) if hr_values.size else None
 
-    ibi_values: list[float] = []
+    ibi_records: list[tuple[float, float]] = []
     for sample in window_samples.get("IBI") or []:
-        if isinstance(sample, dict):
-            value = sample.get("interval")
-        else:
-            value = sample
+        if not isinstance(sample, dict):
+            # RMSSD requires beat timing so intervals separated by a dropped beat
+            # are never treated as adjacent beats.
+            continue
         try:
-            interval = float(value)
+            interval = float(sample.get("interval"))
+            offset = float(sample.get("offset"))
         except (TypeError, ValueError):
             continue
-        if np.isfinite(interval) and 0.30 <= interval <= 2.00:
-            ibi_values.append(interval)
-    ibi = np.asarray(ibi_values, dtype=np.float64)
-    hrv_rmssd_ms = (
-        round(float(np.sqrt(np.mean(np.square(np.diff(ibi)))) * 1000.0), 1)
-        if ibi.size >= 4
+        if (
+            np.isfinite(interval)
+            and np.isfinite(offset)
+            and 0.30 <= interval <= 2.00
+        ):
+            ibi_records.append((offset, interval))
+    ibi_records.sort(key=lambda record: record[0])
+    consecutive_diffs: list[float] = []
+    for previous, current in zip(ibi_records, ibi_records[1:]):
+        previous_offset, previous_interval = previous
+        current_offset, current_interval = current
+        offset_delta = current_offset - previous_offset
+        if abs(offset_delta - current_interval) <= 0.15 * current_interval:
+            consecutive_diffs.append(current_interval - previous_interval)
+    hrv_rmssd_ms = None
+    if len(consecutive_diffs) >= 3:
+        diffs = np.asarray(consecutive_diffs, dtype=np.float64)
+        hrv_rmssd_ms = round(float(np.sqrt(np.mean(np.square(diffs))) * 1000.0), 1)
+    ibi_total = len(window_samples.get("IBI") or [])
+    signal_quality = (
+        round(len(consecutive_diffs) / max(1, ibi_total - 1), 3)
+        if ibi_total > 1
         else None
     )
-    ibi_total = len(window_samples.get("IBI") or [])
-    signal_quality = round(float(ibi.size) / ibi_total, 3) if ibi_total else None
 
     ref_hr = float(baseline_hr_bpm) if baseline_hr_bpm is not None else None
     hr_delta_bpm = (

@@ -13,6 +13,7 @@ import uuid
 
 import joblib
 import psycopg
+from psycopg_pool import ConnectionPool
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
@@ -24,7 +25,8 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from wesad.demo_simulator import SCENARIO_CATALOG, generate_scenario_windows  # noqa: E402
-from wesad.pickle_reader import recording_origin_epoch  # noqa: E402
+from wesad.pickle_reader import pickle_wrist_origin_epoch  # noqa: E402
+from wesad.replay_clock import ensure_replay_clock  # noqa: E402
 from wesad.vitals import classify_activity  # noqa: E402
 
 DATA_ROOT = Path(os.getenv("WESAD_DATA_ROOT", r"D:\btldll\archive\WESAD"))
@@ -62,6 +64,7 @@ demo_predictions: dict[str, list[dict[str, Any]]] = {}
 demo_spark_rows: dict[str, list[dict[str, Any]]] = {}
 demo_feedback: dict[tuple[str, str], dict[str, Any]] = {}
 _cached_rf_bundle: dict[str, Any] | None = None
+_db_pool: ConnectionPool | None = None
 
 
 def _load_local_rf() -> tuple[Any, str, str | None]:
@@ -117,16 +120,22 @@ def _seed_initial_demo_data() -> None:
         pass
 
 
-def db_connect() -> psycopg.Connection[Any]:
-    return psycopg.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=int(os.getenv("DB_PORT", "5432")),
-        dbname=os.getenv("DB_NAME", "wesad"),
-        user=os.getenv("DB_USER", "wesad"),
-        password=os.getenv("DB_PASSWORD", "wesad_dev_password"),
-        row_factory=dict_row,
-        connect_timeout=4,
-    )
+def _db_connection_kwargs() -> dict[str, Any]:
+    return {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "wesad"),
+        "user": os.getenv("DB_USER", "wesad"),
+        "password": os.getenv("DB_PASSWORD", "wesad_dev_password"),
+        "row_factory": dict_row,
+        "connect_timeout": 4,
+    }
+
+
+def db_connect() -> Any:
+    if _db_pool is not None:
+        return _db_pool.connection(timeout=4)
+    return psycopg.connect(**_db_connection_kwargs())
 
 
 def ensure_db_extensions(connection: psycopg.Connection[Any]) -> None:
@@ -146,6 +155,7 @@ def ensure_db_extensions(connection: psycopg.Connection[Any]) -> None:
         )
         """
     )
+    ensure_replay_clock(connection)
     connection.commit()
 
 
@@ -226,9 +236,30 @@ def stop_all_sessions() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    global _db_pool
+    if not DEMO_MODE:
+        _db_pool = ConnectionPool(
+            kwargs=_db_connection_kwargs(),
+            min_size=1,
+            max_size=8,
+            open=False,
+        )
+        _db_pool.open(wait=True)
+        try:
+            with db_connect() as connection:
+                ensure_db_extensions(connection)
+        except Exception:
+            _db_pool.close()
+            _db_pool = None
+            raise
     _seed_initial_demo_data()
-    yield
-    stop_all_sessions()
+    try:
+        yield
+    finally:
+        stop_all_sessions()
+        if _db_pool is not None:
+            _db_pool.close()
+            _db_pool = None
 
 
 app = FastAPI(
@@ -782,7 +813,6 @@ def device_predictions(subject_id: str, limit: int = 20) -> list[dict[str, Any]]
 
     try:
         with db_connect() as connection:
-            ensure_db_extensions(connection)
             rows = connection.execute(
                 """
                 SELECT subject_id, window_start, window_end, prediction,
@@ -844,19 +874,22 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
             subject_dir = DATA_ROOT / subject_id
             if duration > 0 and (subject_dir / f"{subject_id}.pkl").is_file():
                 try:
-                    origin_epoch = recording_origin_epoch(
-                        subject_dir, ("ACC", "BVP", "EDA", "TEMP")
-                    )
+                    origin_epoch = pickle_wrist_origin_epoch(subject_dir)
                     replay_start = datetime.fromtimestamp(
                         origin_epoch + offset, timezone.utc
                     )
                     replay_bounds = (replay_start, replay_start + timedelta(seconds=duration))
-                except (OSError, ValueError):
-                    replay_bounds = None
+                except (OSError, ValueError, KeyError, StopIteration) as error:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Không căn được timeline pickle với BVP.csv; "
+                            "từ chối hiển thị dữ liệu của lần replay khác."
+                        ),
+                    ) from error
 
     try:
         with db_connect() as connection:
-            ensure_db_extensions(connection)
             if replay_bounds:
                 replay_start, replay_end = replay_bounds
                 pred_rows = connection.execute(
@@ -1025,7 +1058,6 @@ def save_feedback(request: FeedbackRequest) -> dict[str, Any]:
 
     try:
         with db_connect() as connection:
-            ensure_db_extensions(connection)
             connection.execute(
                 """
                 INSERT INTO prediction_feedback (subject_id, window_start, verdict, note, updated_at)

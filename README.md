@@ -49,11 +49,13 @@ Tạo topic:
 docker exec wesad-kafka /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic wearable.sensor.v1 --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
 ```
 
-Phát tối đa 1.000 mẫu từ S2. `--speed 60` phát lại nhanh hơn thời gian ghi trong dữ liệu 60 lần:
+Để chỉ kiểm tra Kafka khi chưa bật PostgreSQL/Spark, phát tối đa 1.000 mẫu từ S2 và bỏ qua cấp mốc thời gian nội bộ:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\produce_e4.py --subject S2 --speed 60 --limit 1000
+.\.venv\Scripts\python.exe scripts\produce_e4.py --subject S2 --speed 60 --limit 1000 --stream-shift-seconds 0
 ```
+
+Trong luồng Spark đầy đủ, bỏ `--stream-shift-seconds`: Producer sẽ tự xin một khoảng thời gian nội bộ từ PostgreSQL để các lần phát lại lùi/tiến offset vẫn qua được watermark của Spark. Trường `timestamp` trong bản tin vẫn giữ thời gian gốc của WESAD; Spark đổi timestamp nội bộ về thời gian gốc trước khi ghi PostgreSQL.
 
 Xem thử 10 bản ghi trong topic ở terminal khác:
 
@@ -70,6 +72,8 @@ docker compose down
 ## Chạy Spark Structured Streaming và monitoring
 
 Spark chạy trong Apache Spark Docker image, nên không cần cài Java/Spark trực tiếp trên Windows. Compose khởi động Spark, Kafka, PostgreSQL, Prometheus, cAdvisor và JMX Exporter cùng Grafana. Spark gom dữ liệu Kafka theo cửa sổ 10 giây rồi ghi số mẫu, trung bình, thấp nhất và cao nhất của từng cảm biến vào PostgreSQL. Checkpoint nằm trong `checkpoints/spark-postgres`, vì vậy lần chạy sau tiếp tục từ offset đã xử lý. Mẫu TEMP ngoài khoảng 20–45 °C bị loại.
+
+Khi phát dữ liệu để Spark xử lý, PostgreSQL phải đang chạy vì Producer cấp một dải thời gian sự kiện tăng đơn điệu qua bảng `replay_stream_clock`. Điều này giúp Spark append-mode không loại bỏ một kịch bản mới chỉ vì timestamp WESAD quay ngược về một offset cũ. Timestamp lưu vào bảng tổng hợp vẫn là timestamp gốc của bản ghi.
 
 Nếu Spark đang chạy bằng lệnh `docker run` cũ trong một terminal, nhấn `Ctrl+C` ở terminal đó trước để tránh chạy hai Spark consumer cùng ghi vào PostgreSQL. Áp dụng schema một lần nếu database chưa có các bảng mới (các lệnh `IF NOT EXISTS` giữ nguyên bảng dự đoán hiện tại):
 
@@ -333,7 +337,7 @@ npm run dev
 
 ```text
 src/wesad/e4_reader.py        Đọc từng mẫu E4 CSV, không nạp toàn bộ cảm biến vào RAM
-src/wesad/pickle_reader.py    Phát tín hiệu wrist pickle đồng bộ + suy diễn kênh HR 1 Hz từ BVP
+src/wesad/pickle_reader.py    Căn mốc pickle với BVP.csv rồi phát wrist signals + HR/IBI CSV
 src/wesad/features.py         Định nghĩa 16 đặc trưng miền thời gian dùng chung cho train và Edge
 src/wesad/vitals.py           Trích xuất nhịp tim (BPM), HRV (RMSSD), bối cảnh vận động & mã giải thích
 src/wesad/demo_simulator.py   Danh mục 4 kịch bản thực tế & bộ phát sóng E4 cho chế độ trình diễn

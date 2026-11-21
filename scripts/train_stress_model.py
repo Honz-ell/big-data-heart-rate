@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import gc
 import pickle
 import sys
@@ -26,6 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from wesad.features import FEATURE_NAMES, SAMPLE_RATES_HZ, sensor_features  # noqa: E402
 from wesad.e4_reader import iter_sensor_samples  # noqa: E402
+from wesad.pickle_reader import calibrate_pickle_origin_epoch  # noqa: E402
 
 LABEL_RATE_HZ = 700
 NON_STRESS_LABELS = (1, 3, 4)
@@ -148,15 +148,19 @@ def extract_subject_csv(
     with pkl_path.open("rb") as handle:
         payload = pickle.load(handle, encoding="latin1")
     labels = np.asarray(payload["label"]).reshape(-1).astype(np.int64, copy=False)
-    origin_epochs: list[float] = []
-    for sensor in SAMPLE_RATES_HZ:
-        csv_path = e4_dir / f"{sensor}.csv"
-        with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
-            first = next(csv.reader(handle), None)
-        if not first or not first[0].strip():
-            raise ValueError(f"Không đọc được mốc thời gian trong {csv_path}")
-        origin_epochs.append(float(first[0]))
-    origin_epoch = min(origin_epochs)
+    wrist = payload["signal"]["wrist"]
+    pickle_wrist = {
+        (key.decode("latin1") if isinstance(key, bytes) else str(key)).upper(): value
+        for key, value in wrist.items()
+    }
+    origin_epoch, aligned = calibrate_pickle_origin_epoch(
+        subject_dir, np.asarray(pickle_wrist["BVP"])
+    )
+    if not aligned:
+        raise ValueError(
+            f"{subject_dir.name}: không thể căn CSV với timeline pickle; "
+            "dừng để tránh ghép nhãn sai cửa sổ."
+        )
 
     samples_per_label_window = window_seconds * LABEL_RATE_HZ
     full_windows = labels.size // samples_per_label_window

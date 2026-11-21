@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from wesad.e4_reader import iter_sensor_samples  # noqa: E402
 from wesad.features import FEATURE_NAMES, SAMPLE_RATES_HZ, sensor_features  # noqa: E402
+from wesad.pickle_reader import calibrate_pickle_origin_epoch  # noqa: E402
 
 LABEL_RATE_HZ = 700
 STRESS_LABEL = 2
@@ -100,7 +101,11 @@ def main() -> int:
             for key, value in wrist.items()
         }
         sensor_starts = csv_sensor_starts(e4_dir)
-        origin = min(sensor_starts.values())
+        origin, aligned = calibrate_pickle_origin_epoch(
+            subject_dir, np.asarray(wrist_by_name["BVP"])
+        )
+        if not aligned:
+            raise ValueError("Không căn chỉnh được timestamp pickle với BVP.csv")
     except (OSError, EOFError, pickle.UnpicklingError, KeyError, ValueError) as error:
         print(f"Không đọc được dữ liệu/nhãn: {error}")
         return 1
@@ -138,7 +143,7 @@ def main() -> int:
         f"{datetime.fromtimestamp(start_epoch, timezone.utc).isoformat()} – "
         f"{datetime.fromtimestamp(end_epoch, timezone.utc).isoformat()}"
     )
-    print("CSV sensor header offsets from earliest sensor:")
+    print("CSV sensor header offsets from aligned pickle origin:")
     for sensor, timestamp in sensor_starts.items():
         print(f"  {sensor}: {timestamp - origin:.3f}s")
 
