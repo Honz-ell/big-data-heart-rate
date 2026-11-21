@@ -5,3 +5,14 @@ node_modules/
 .next/
 out/
 .env*
+data/**
+!data/.gitkeep
+models/**
+!models/.gitkeep
+checkpoints/**
+scripts/runtime/**
+*.joblib
+*.pkl
+*.pickle
+*.log
+*.crc
