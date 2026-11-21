@@ -141,7 +141,7 @@ services:
       - --watermark
       - "15 seconds"
       - --checkpoint-location
-      - /opt/project/checkpoints/spark-postgres
+      - /opt/project/checkpoints/spark-postgres-v2
       - --metrics-host
       - 0.0.0.0
       - --metrics-port

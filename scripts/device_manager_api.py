@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -56,7 +56,12 @@ class FeedbackRequest(BaseModel):
 sessions: dict[str, dict[str, Any]] = {}
 sessions_lock = threading.RLock()
 
-# Demo / sandbox in-memory stores (used when WESAD_DEMO_MODE=1 or explicit demo replay)
+# Persistent PostgreSQL connection to avoid per-poll TCP/auth & DDL lock overhead
+_db_lock = threading.RLock()
+_shared_conn: psycopg.Connection[Any] | None = None
+_schema_checked = False
+
+# Demo / sandbox in-memory stores
 demo_predictions: dict[str, list[dict[str, Any]]] = {}
 demo_spark_rows: dict[str, list[dict[str, Any]]] = {}
 demo_feedback: dict[tuple[str, str], dict[str, Any]] = {}
@@ -71,7 +76,7 @@ def _load_local_rf() -> tuple[Any, str, str | None]:
     active_version: str | None = _cached_rf_bundle.get("model_version") or "v1.0.0"
     active_file = model_path.name
     try:
-        resp = requests.get(f"{REGISTRY_URL.rstrip('/')}/models/active", timeout=1.5)
+        resp = requests.get(f"{REGISTRY_URL.rstrip('/')}/models/active", timeout=1.0)
         if resp.status_code == 200:
             payload = resp.json()
             active_version = str(payload.get("version") or active_version)
@@ -90,7 +95,7 @@ def _infer_scenario_id(offset_seconds: int, explicit_id: str | None) -> str:
         return explicit_id
     if offset_seconds <= 900:
         return "baseline_calm"
-    if 1800 <= offset_seconds <= 2600:
+    if 3400 <= offset_seconds <= 3630 or 1800 <= offset_seconds <= 2600:
         return "physical_activity_check"
     if offset_seconds >= 4050:
         return "stress_to_recovery"
@@ -116,7 +121,7 @@ def _seed_initial_demo_data() -> None:
         pass
 
 
-def db_connect() -> psycopg.Connection[Any]:
+def _open_new_conn() -> psycopg.Connection[Any]:
     return psycopg.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", "5432")),
@@ -124,28 +129,45 @@ def db_connect() -> psycopg.Connection[Any]:
         user=os.getenv("DB_USER", "wesad"),
         password=os.getenv("DB_PASSWORD", "wesad_dev_password"),
         row_factory=dict_row,
-        connect_timeout=4,
+        autocommit=True,
+        connect_timeout=3,
     )
 
 
-def ensure_db_extensions(connection: psycopg.Connection[Any]) -> None:
-    connection.execute(
-        "ALTER TABLE stress_predictions "
-        "ADD COLUMN IF NOT EXISTS vitals JSONB NOT NULL DEFAULT '{}'::jsonb"
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS prediction_feedback (
-            subject_id TEXT NOT NULL,
-            window_start TIMESTAMPTZ NOT NULL,
-            verdict TEXT NOT NULL CHECK (verdict IN ('ACCURATE', 'FALSE_ALARM')),
-            note TEXT NOT NULL DEFAULT '',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (subject_id, window_start)
+def _get_db() -> psycopg.Connection[Any]:
+    """Return a fast reusable PostgreSQL connection; run schema check only once."""
+    global _shared_conn, _schema_checked
+    if _shared_conn is None or _shared_conn.closed or _shared_conn.broken:
+        _shared_conn = _open_new_conn()
+    if not _schema_checked:
+        _shared_conn.execute(
+            "ALTER TABLE stress_predictions "
+            "ADD COLUMN IF NOT EXISTS vitals JSONB NOT NULL DEFAULT '{}'::jsonb"
         )
-        """
-    )
-    connection.commit()
+        _shared_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prediction_feedback (
+                subject_id TEXT NOT NULL,
+                window_start TIMESTAMPTZ NOT NULL,
+                verdict TEXT NOT NULL CHECK (verdict IN ('ACCURATE', 'FALSE_ALARM')),
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (subject_id, window_start)
+            )
+            """
+        )
+        _schema_checked = True
+    return _shared_conn
+
+
+def _reset_db() -> None:
+    global _shared_conn
+    if _shared_conn is not None:
+        try:
+            _shared_conn.close()
+        except Exception:
+            pass
+        _shared_conn = None
 
 
 def process_state(process: subprocess.Popen[bytes] | None) -> str:
@@ -155,11 +177,16 @@ def process_state(process: subprocess.Popen[bytes] | None) -> str:
     return "running" if code is None else ("completed" if code == 0 else f"failed:{code}")
 
 
-def read_tail(path: Path | None, lines: int = 16) -> list[str]:
+def read_tail(path: Path | None, lines: int = 14) -> list[str]:
     if path is None or not path.is_file():
         return []
     try:
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 6144), os.SEEK_SET)
+            tail_bytes = handle.read()
+        return tail_bytes.decode("utf-8", errors="replace").splitlines()[-lines:]
     except OSError:
         return []
 
@@ -178,14 +205,18 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
             "edge_status": session.get("demo_edge_status", "completed"),
             "consumer_group": session["consumer_group"],
             "mode": "demo_replay",
-            "producer_logs": list(session.get("demo_producer_logs", []))[-16:],
-            "edge_logs": list(session.get("demo_edge_logs", []))[-16:],
+            "producer_logs": list(session.get("demo_producer_logs", []))[-14:],
+            "edge_logs": list(session.get("demo_edge_logs", []))[-14:],
         }
 
     def current_state(name: str) -> str:
         if session.get(f"{name}_stopped"):
             return "stopped"
-        return process_state(session.get(name))
+        override = session.get(f"{name}_override")
+        proc = session.get(name)
+        if proc is None and override:
+            return str(override)
+        return process_state(proc)
 
     return {
         "device_id": f"wearable-{subject_id.lower()}",
@@ -209,18 +240,21 @@ def stop_process(process: subprocess.Popen[bytes] | None) -> None:
         return
     process.terminate()
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=3)
+        process.wait(timeout=2)
 
 
 def stop_all_sessions() -> None:
     with sessions_lock:
         for session in sessions.values():
+            session["cancelled"] = True
             session["demo_cancelled"] = True
             stop_process(session.get("producer"))
             stop_process(session.get("edge"))
+    with _db_lock:
+        _reset_db()
 
 
 @asynccontextmanager
@@ -232,7 +266,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="WESAD Device Manager & Health Telemetry API",
-    version="1.1.0",
+    version="1.2.0",
     description="Start/stop WESAD streams and serve dual-speed Spark (10s) + Edge AI (30s) physiological timelines.",
     lifespan=lifespan,
 )
@@ -245,7 +279,7 @@ app.add_middleware(
         "http://127.0.0.1:3001",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -316,10 +350,11 @@ def _start_demo_session(request: StartDeviceRequest, scenario_id: str) -> dict[s
         "speed": request.speed,
         "consumer_group": consumer_group,
         "created_at": now_dt.isoformat(),
+        "started_at_dt": now_dt,
         "demo_producer_status": "running",
         "demo_edge_status": "running",
         "demo_producer_logs": [
-            f"[Sandbox Replay] Đang phát {subject_id} (ACC, BVP, EDA, HR, TEMP) kịch bản={scenario_id}, "
+            f"[Sandbox Replay] Đang phát {subject_id} kịch bản={scenario_id}, "
             f"offset={request.start_offset_seconds}s, duration={request.duration_seconds}s, speed={request.speed}x"
         ],
         "demo_edge_logs": [
@@ -337,9 +372,8 @@ def _start_demo_session(request: StartDeviceRequest, scenario_id: str) -> dict[s
         demo_predictions[subject_id] = []
 
     def worker() -> None:
-        # Stream 10s Spark slices and 30s Edge predictions progressively so charts animate live
-        step_delay = max(0.22, min(0.85, 10.0 / max(10.0, float(request.speed))))
-        spark_per_10s = 5  # HR, EDA, TEMP, ACC, BVP
+        step_delay = max(0.22, min(0.80, 10.0 / max(10.0, float(request.speed))))
+        spark_per_10s = 5
         total_10s_buckets = len(pred_rows) * 3
         sent_samples = 0
 
@@ -361,7 +395,6 @@ def _start_demo_session(request: StartDeviceRequest, scenario_id: str) -> dict[s
 
                 if (bucket_idx + 1) % 3 == 0:
                     pred = pred_rows[bucket_idx // 3]
-                    # Refresh active version label if user hot-swapped in Registry mid-stream
                     _, cur_file, cur_ver = _load_local_rf()
                     pred = {**pred, "model_file": cur_file, "model_version": cur_ver}
                     demo_predictions.setdefault(subject_id, []).append(pred)
@@ -377,7 +410,7 @@ def _start_demo_session(request: StartDeviceRequest, scenario_id: str) -> dict[s
                 session["demo_producer_status"] = "completed"
                 session["demo_edge_status"] = "completed"
                 session["demo_producer_logs"].append(
-                    f"Hoàn tất phát {sent_samples:,} mẫu cảm biến ({len(pred_rows)} cửa sổ AI 30s · {total_10s_buckets} cửa sổ Spark 10s)."
+                    f"Hoàn tất phát {sent_samples:,} mẫu ({len(pred_rows)} cửa sổ AI 30s · {total_10s_buckets} cửa sổ Spark 10s)."
                 )
 
     threading.Thread(target=worker, daemon=True).start()
@@ -401,24 +434,56 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
     if not DEFAULT_MODEL.is_file():
         raise HTTPException(status_code=503, detail=f"Default model is missing: {DEFAULT_MODEL}")
 
+    prev_procs: list[subprocess.Popen[bytes] | None] = []
+    now_dt = datetime.now(timezone.utc)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    session_id = uuid.uuid4().hex[:8]
+    consumer_group = f"edge-{subject_id.lower()}-{session_id}"
+    edge_log = RUNTIME_DIR / f"{subject_id}-{session_id}-edge.log"
+    producer_log = RUNTIME_DIR / f"{subject_id}-{session_id}-producer.log"
+
     with sessions_lock:
         previous = sessions.get(subject_id)
         if previous:
-            prod_running = process_state(previous.get("producer")) == "running"
-            edge_running = process_state(previous.get("edge")) == "running"
+            prod_running = (
+                previous.get("producer_override") == "starting"
+                or process_state(previous.get("producer")) == "running"
+            )
             if prod_running and not request.replace_running:
                 raise HTTPException(status_code=409, detail=f"{subject_id} is already running")
-            if prod_running or edge_running:
-                stop_process(previous.get("producer"))
-                stop_process(previous.get("edge"))
-                previous["producer_stopped"] = True
-                previous["edge_stopped"] = True
+            previous["cancelled"] = True
+            previous["producer_stopped"] = True
+            previous["edge_stopped"] = True
+            prev_procs.extend([previous.get("producer"), previous.get("edge")])
 
-        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-        session_id = uuid.uuid4().hex[:8]
-        consumer_group = f"edge-{subject_id.lower()}-{session_id}"
-        edge_log = RUNTIME_DIR / f"{subject_id}-{session_id}-edge.log"
-        producer_log = RUNTIME_DIR / f"{subject_id}-{session_id}-producer.log"
+        session: dict[str, Any] = {
+            "is_demo": False,
+            "cancelled": False,
+            "scenario_id": scenario_id,
+            "producer": None,
+            "edge": None,
+            "producer_override": "starting",
+            "edge_override": "starting",
+            "producer_stopped": False,
+            "edge_stopped": False,
+            "producer_log": producer_log,
+            "edge_log": edge_log,
+            "start_offset_seconds": request.start_offset_seconds,
+            "duration_seconds": request.duration_seconds,
+            "speed": request.speed,
+            "consumer_group": consumer_group,
+            "created_at": now_dt.isoformat(),
+            "started_at_dt": now_dt,
+        }
+        sessions[subject_id] = session
+
+    # Launch Edge + Producer asynchronously so HTTP response returns in <15ms without blocking UI
+    def launch_worker() -> None:
+        for proc in prev_procs:
+            stop_process(proc)
+        if session.get("cancelled"):
+            return
+
         python = sys.executable
         edge_command = [
             python, "-u", str(PROJECT_ROOT / "scripts" / "edge_inference.py"),
@@ -443,12 +508,12 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             "--broker", BROKER,
             "--topic", TOPIC,
         ]
-        edge_process: subprocess.Popen[bytes] | None = None
         child_env = os.environ.copy()
         child_env["PYTHONUTF8"] = "1"
+        edge_proc: subprocess.Popen[bytes] | None = None
         try:
             with edge_log.open("w", encoding="utf-8") as edge_output:
-                edge_process = subprocess.Popen(
+                edge_proc = subprocess.Popen(
                     edge_command,
                     cwd=PROJECT_ROOT,
                     stdin=subprocess.DEVNULL,
@@ -456,19 +521,32 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
                     stderr=subprocess.STDOUT,
                     env=child_env,
                 )
+            with sessions_lock:
+                session["edge"] = edge_proc
+                session["edge_override"] = None
 
-            ready_deadline = time.monotonic() + 15
+            ready_deadline = time.monotonic() + 20.0
             while time.monotonic() < ready_deadline:
-                if edge_process.poll() is not None:
-                    raise RuntimeError(f"Edge exited early; inspect {edge_log.name}")
-                if "edge simulator" in "\n".join(read_tail(edge_log, 30)).lower():
+                if session.get("cancelled"):
+                    stop_process(edge_proc)
+                    return
+                if edge_proc.poll() is not None:
+                    session["producer_override"] = "failed:edge_exited"
+                    return
+                if "edge simulator" in "\n".join(read_tail(edge_log, 25)).lower():
                     break
-                time.sleep(0.25)
+                time.sleep(0.18)
             else:
-                raise RuntimeError(f"Edge did not become ready; inspect {edge_log.name}")
+                stop_process(edge_proc)
+                session["producer_override"] = "failed:edge_timeout"
+                return
+
+            if session.get("cancelled"):
+                stop_process(edge_proc)
+                return
 
             with producer_log.open("w", encoding="utf-8") as producer_output:
-                producer_process = subprocess.Popen(
+                prod_proc = subprocess.Popen(
                     producer_command,
                     cwd=PROJECT_ROOT,
                     stdin=subprocess.DEVNULL,
@@ -476,27 +554,20 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
                     stderr=subprocess.STDOUT,
                     env=child_env,
                 )
-        except (OSError, RuntimeError) as error:
-            stop_process(edge_process)
-            raise HTTPException(status_code=503, detail=str(error)) from error
+            with sessions_lock:
+                session["producer"] = prod_proc
+                session["producer_override"] = None
+                if session.get("cancelled"):
+                    stop_process(prod_proc)
+                    stop_process(edge_proc)
+        except OSError:
+            stop_process(edge_proc)
+            with sessions_lock:
+                session["producer_override"] = "failed:spawn"
+                session["edge_override"] = "failed:spawn"
 
-        session = {
-            "is_demo": False,
-            "scenario_id": scenario_id,
-            "producer": producer_process,
-            "edge": edge_process,
-            "producer_stopped": False,
-            "edge_stopped": False,
-            "producer_log": producer_log,
-            "edge_log": edge_log,
-            "start_offset_seconds": request.start_offset_seconds,
-            "duration_seconds": request.duration_seconds,
-            "speed": request.speed,
-            "consumer_group": consumer_group,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        sessions[subject_id] = session
-        return public_session(subject_id, session)
+    threading.Thread(target=launch_worker, daemon=True).start()
+    return public_session(subject_id, session)
 
 
 @app.post("/devices/{subject_id}/stop")
@@ -505,22 +576,97 @@ def stop_device(subject_id: str) -> dict[str, Any]:
         session = sessions.get(subject_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"No session for {subject_id}")
+        session["cancelled"] = True
         if session.get("is_demo"):
             session["demo_cancelled"] = True
             session["demo_producer_status"] = "stopped"
             session["demo_edge_status"] = "stopped"
             return public_session(subject_id, session)
-        stop_process(session.get("producer"))
-        stop_process(session.get("edge"))
+        proc_p = session.get("producer")
+        proc_e = session.get("edge")
         session["producer_stopped"] = True
         session["edge_stopped"] = True
-        return public_session(subject_id, session)
+
+    stop_process(proc_p)
+    stop_process(proc_e)
+    with sessions_lock:
+        return public_session(subject_id, sessions[subject_id])
+
+
+@app.delete("/devices/{subject_id}/history")
+def clear_subject_history(subject_id: str) -> dict[str, Any]:
+    if not subject_id.startswith("S") or not subject_id[1:].isdigit():
+        raise HTTPException(status_code=422, detail="Invalid subject ID")
+    with sessions_lock:
+        demo_predictions.pop(subject_id, None)
+        demo_spark_rows.pop(subject_id, None)
+        if subject_id in sessions:
+            sessions[subject_id]["started_at_dt"] = datetime.now(timezone.utc)
+    if DEMO_MODE:
+        return {"cleared": True, "subject_id": subject_id}
+
+    try:
+        with _db_lock:
+            conn = _get_db()
+            conn.execute("DELETE FROM stress_predictions WHERE subject_id = %s", (subject_id,))
+            conn.execute("DELETE FROM sensor_window_aggregates WHERE subject_id = %s", (subject_id,))
+            conn.execute("DELETE FROM prediction_feedback WHERE subject_id = %s", (subject_id,))
+    except psycopg.Error as error:
+        _reset_db()
+        raise HTTPException(status_code=503, detail="Could not clear PostgreSQL history") from error
+    return {"cleared": True, "subject_id": subject_id}
 
 
 def _iso_utc(val: Any) -> str:
     if isinstance(val, datetime):
         return val.astimezone(timezone.utc).isoformat()
     return str(val)
+
+
+def _to_dt(val: Any) -> datetime:
+    if isinstance(val, datetime):
+        return val.astimezone(timezone.utc)
+    return datetime.fromisoformat(str(val).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _extract_latest_contiguous_segment(
+    rows_newest_created_first: list[dict[str, Any]],
+    max_windows: int,
+) -> list[dict[str, Any]]:
+    """Isolate the most recently generated contiguous scenario segment so old runs at different offsets never squish the chart."""
+    if not rows_newest_created_first:
+        return []
+    anchor = rows_newest_created_first[0]
+    anchor_created = _to_dt(anchor.get("created_at") or anchor["window_start"])
+
+    # Keep rows created in the same recent batch/run (within 10 minutes of newest row) and contiguous in recording time
+    recent_pool = [
+        r
+        for r in rows_newest_created_first
+        if abs((anchor_created - _to_dt(r.get("created_at") or r["window_start"])).total_seconds()) <= 600
+    ]
+    by_window = sorted(recent_pool, key=lambda r: _to_dt(r["window_start"]))
+
+    # Partition into contiguous segments (gap between consecutive window_start <= 90s)
+    segments: list[list[dict[str, Any]]] = []
+    for row in by_window:
+        w_dt = _to_dt(row["window_start"])
+        if not segments:
+            segments.append([row])
+            continue
+        prev_dt = _to_dt(segments[-1][-1]["window_start"])
+        if (w_dt - prev_dt).total_seconds() <= 95:
+            segments[-1].append(row)
+        else:
+            segments.append([row])
+
+    # Pick the segment containing our newest `anchor` row
+    anchor_ws = _iso_utc(anchor["window_start"])
+    chosen = next(
+        (seg for seg in segments if any(_iso_utc(item["window_start"]) == anchor_ws for item in seg)),
+        segments[-1],
+    )
+    return chosen[-max_windows:]
 
 
 def _pivot_spark_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -561,6 +707,64 @@ def _pivot_spark_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif sensor == "BVP":
             entry["bvp_range"] = round(max_v - min_v, 2)
     return [buckets[k] for k in sorted(buckets.keys())]
+
+
+def _merge_subwindow_fallbacks(
+    preds_chrono: list[dict[str, Any]],
+    spark_points: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ensure every 30s prediction window has 3 x 10s vital points even if Spark micro-batch is still in flight."""
+    by_start: dict[str, dict[str, Any]] = {pt["window_start_utc"]: dict(pt) for pt in spark_points}
+    for pred in preds_chrono:
+        base_dt = _to_dt(pred["window_start"])
+        vit = pred.get("vitals") or {}
+        subs = vit.get("sub_windows_10s")
+        if isinstance(subs, list) and len(subs) == 3:
+            for idx, sub in enumerate(subs):
+                s_dt = base_dt + timedelta(seconds=idx * 10)
+                e_dt = s_dt + timedelta(seconds=10)
+                key = s_dt.isoformat()
+                if key not in by_start:
+                    by_start[key] = {
+                        "window_start_utc": key,
+                        "window_end_utc": e_dt.isoformat(),
+                        "hr_bpm": sub.get("hr_bpm"),
+                        "eda_us": sub.get("eda_us"),
+                        "temp_c": sub.get("temp_c"),
+                        "acc_mean": sub.get("acc_mean"),
+                        "acc_range": sub.get("acc_range"),
+                        "bvp_range": None,
+                        "sample_count_total": int(sub.get("sample_count_total") or 1040),
+                        "spark_batch_id": 0,
+                    }
+                else:
+                    existing = by_start[key]
+                    if existing["hr_bpm"] is None and sub.get("hr_bpm") is not None:
+                        existing["hr_bpm"] = sub["hr_bpm"]
+                    if existing["eda_us"] is None and sub.get("eda_us") is not None:
+                        existing["eda_us"] = sub["eda_us"]
+                    if existing["temp_c"] is None and sub.get("temp_c") is not None:
+                        existing["temp_c"] = sub["temp_c"]
+        else:
+            # Synthesize 3 even 10s slots from 30s summary vitals for legacy rows
+            for idx in range(3):
+                s_dt = base_dt + timedelta(seconds=idx * 10)
+                e_dt = s_dt + timedelta(seconds=10)
+                key = s_dt.isoformat()
+                if key not in by_start:
+                    by_start[key] = {
+                        "window_start_utc": key,
+                        "window_end_utc": e_dt.isoformat(),
+                        "hr_bpm": vit.get("hr_bpm"),
+                        "eda_us": vit.get("eda_mean_us"),
+                        "temp_c": vit.get("temp_mean_c"),
+                        "acc_mean": None,
+                        "acc_range": None,
+                        "bvp_range": None,
+                        "sample_count_total": 1040,
+                        "spark_batch_id": 0,
+                    }
+    return [by_start[k] for k in sorted(by_start.keys())]
 
 
 def _backfill_legacy_vitals(
@@ -622,12 +826,21 @@ def _backfill_legacy_vitals(
 def _build_clinical_summary(
     chronological_preds: list[dict[str, Any]],
     spark_points: list[dict[str, Any]],
+    is_warming_up: bool = False,
 ) -> dict[str, Any]:
     if not chronological_preds and not spark_points:
         return {
             "status": "NO_DATA",
-            "headline": "Chưa có dữ liệu phiên đo cho thiết bị này",
-            "recommendation": "Chọn một kịch bản mẫu ở thanh trên (ví dụ: Áp lực thuyết trình TSST) để bắt đầu phát luồng cảm biến.",
+            "headline": (
+                "Đang khởi tạo & thu thập cửa sổ cảm biến đầu tiên..."
+                if is_warming_up
+                else "Chưa có dữ liệu phiên đo cho thiết bị này"
+            ),
+            "recommendation": (
+                "Producer đang phát mẫu Empatica E4 vào Kafka; kết quả 10s/30s sẽ hiển thị ngay sau vài giây."
+                if is_warming_up
+                else "Chọn một kịch bản mẫu ở thanh trên (ví dụ: Áp lực thuyết trình TSST) để bắt đầu phát luồng cảm biến."
+            ),
             "latest_hr_bpm": None,
             "baseline_hr_bpm": None,
             "hr_delta_bpm": None,
@@ -669,7 +882,6 @@ def _build_clinical_summary(
         else latest_vit.get("temp_mean_c")
     )
 
-    # Trailing consecutive stress streak
     streak = 0
     for item in reversed(chronological_preds):
         if item["prediction"] == "STRESS":
@@ -687,14 +899,13 @@ def _build_clinical_summary(
         if item["vitals"].get("heart_anomaly") in {"TACHYCARDIA_AT_REST", "LOW_HRV_STRAIN", "BRADYCARDIA"}
     )
 
-    # Measure recovery time from last STRESS window end to first stabilized calm window
     recovery_seconds: int | None = None
     last_stress_idx: int | None = None
     for idx, item in enumerate(chronological_preds):
         if item["prediction"] == "STRESS":
             last_stress_idx = idx
     if last_stress_idx is not None and last_stress_idx < total_preds - 1:
-        stress_end_dt = datetime.fromisoformat(_iso_utc(chronological_preds[last_stress_idx]["window_end"]))
+        stress_end_dt = _to_dt(chronological_preds[last_stress_idx]["window_end"])
         calm_item = next(
             (
                 chronological_preds[j]
@@ -704,8 +915,10 @@ def _build_clinical_summary(
             ),
             chronological_preds[-1],
         )
-        calm_end_dt = datetime.fromisoformat(_iso_utc(calm_item["window_end"]))
-        recovery_seconds = max(30, int((calm_end_dt - stress_end_dt).total_seconds()))
+        calm_end_dt = _to_dt(calm_item["window_end"])
+        diff_sec = int((calm_end_dt - stress_end_dt).total_seconds())
+        if 10 <= diff_sec <= 900:
+            recovery_seconds = max(30, diff_sec)
 
     activity_state = str(latest_vit.get("activity_state") or "RESTING")
     heart_anomaly = str(latest_vit.get("heart_anomaly") or "NONE")
@@ -746,6 +959,8 @@ def _build_clinical_summary(
                 "Hệ thần kinh tự chủ đang cân bằng tốt."
             )
 
+    real_spark_batches = [int(pt["spark_batch_id"]) for pt in spark_points if int(pt.get("spark_batch_id") or 0) > 0]
+
     return {
         "status": status,
         "headline": headline,
@@ -766,7 +981,7 @@ def _build_clinical_summary(
         "anomaly_windows_count": anomaly_count,
         "recovery_seconds": recovery_seconds,
         "spark_windows_count": len(spark_points),
-        "latest_spark_batch_id": latest_spark.get("spark_batch_id"),
+        "latest_spark_batch_id": max(real_spark_batches) if real_spark_batches else None,
     }
 
 
@@ -783,20 +998,21 @@ def device_predictions(subject_id: str, limit: int = 20) -> list[dict[str, Any]]
         return rows[:limit]
 
     try:
-        with db_connect() as connection:
-            ensure_db_extensions(connection)
-            rows = connection.execute(
+        with _db_lock:
+            conn = _get_db()
+            rows = conn.execute(
                 """
                 SELECT subject_id, window_start, window_end, prediction,
                        model_score_stress, model_file, model_version, sample_counts, vitals
                 FROM stress_predictions
                 WHERE subject_id = %s
-                ORDER BY window_start DESC
+                ORDER BY created_at DESC, window_start DESC
                 LIMIT %s
                 """,
                 (subject_id, limit),
             ).fetchall()
     except psycopg.Error as error:
+        _reset_db()
         raise HTTPException(status_code=503, detail="Could not read prediction history") from error
     return rows
 
@@ -808,7 +1024,19 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
     if not 1 <= limit <= 120:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 120")
 
-    if DEMO_MODE or (subject_id in demo_predictions and sessions.get(subject_id, {}).get("is_demo", DEMO_MODE)):
+    with sessions_lock:
+        active_sess = sessions.get(subject_id)
+        sess_pub = public_session(subject_id, active_sess) if active_sess else None
+        sess_started_dt: datetime | None = active_sess.get("started_at_dt") if active_sess else None
+        is_active_stream = bool(
+            sess_pub
+            and (
+                sess_pub["producer_status"] in {"starting", "running"}
+                or sess_pub["edge_status"] == "starting"
+            )
+        )
+
+    if DEMO_MODE or (subject_id in demo_predictions and active_sess and active_sess.get("is_demo")):
         with sessions_lock:
             preds = [dict(r) for r in demo_predictions.get(subject_id, [])][-limit:]
             raw_spark = [dict(r) for r in demo_spark_rows.get(subject_id, [])][-(limit * 18) :]
@@ -819,7 +1047,7 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
                 item["window_end"] = _iso_utc(item["window_end"])
                 item["vitals"] = _backfill_legacy_vitals(item, spark_points)
                 item["feedback"] = demo_feedback.get(w_key)
-        summary = _build_clinical_summary(preds, spark_points)
+        summary = _build_clinical_summary(preds, spark_points, is_warming_up=is_active_stream)
         return {
             "mode": "demo_replay",
             "subject_id": subject_id,
@@ -829,36 +1057,55 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
         }
 
     try:
-        with db_connect() as connection:
-            ensure_db_extensions(connection)
-            pred_rows = connection.execute(
+        with _db_lock:
+            conn = _get_db()
+            raw_preds = conn.execute(
                 """
                 SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
                        p.model_score_stress, p.model_file, p.model_version,
-                       p.sample_counts, p.vitals,
+                       p.sample_counts, p.vitals, p.created_at,
                        f.verdict AS feedback_verdict, f.note AS feedback_note
                 FROM stress_predictions p
                 LEFT JOIN prediction_feedback f
                   ON f.subject_id = p.subject_id AND f.window_start = p.window_start
                 WHERE p.subject_id = %s
-                ORDER BY p.window_start DESC
-                LIMIT %s
+                ORDER BY p.created_at DESC, p.window_start DESC
+                LIMIT 60
                 """,
-                (subject_id, limit),
+                (subject_id,),
             ).fetchall()
 
-            spark_raw = connection.execute(
-                """
-                SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
-                       sample_count, mean_value, min_value, max_value, spark_batch_id
-                FROM sensor_window_aggregates
-                WHERE subject_id = %s
-                ORDER BY window_start_utc DESC
-                LIMIT %s
-                """,
-                (subject_id, limit * 18),
-            ).fetchall()
+            # Isolate current session if started during this run; otherwise isolate latest contiguous segment
+            if sess_started_dt is not None:
+                cutoff = sess_started_dt - timedelta(seconds=2)
+                session_preds = [r for r in raw_preds if _to_dt(r["created_at"]) >= cutoff]
+                if session_preds:
+                    selected_preds = _extract_latest_contiguous_segment(session_preds, limit)
+                elif is_active_stream:
+                    selected_preds = []
+                else:
+                    selected_preds = _extract_latest_contiguous_segment(raw_preds, limit)
+            else:
+                selected_preds = _extract_latest_contiguous_segment(raw_preds, limit)
+
+            spark_raw: list[dict[str, Any]] = []
+            if selected_preds:
+                min_ws = _to_dt(selected_preds[0]["window_start"])
+                max_we = _to_dt(selected_preds[-1]["window_end"])
+                spark_raw = conn.execute(
+                    """
+                    SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
+                           sample_count, mean_value, min_value, max_value, spark_batch_id
+                    FROM sensor_window_aggregates
+                    WHERE subject_id = %s
+                      AND window_start_utc >= %s
+                      AND window_end_utc <= %s
+                    ORDER BY window_start_utc ASC, ingested_at ASC, spark_batch_id ASC
+                    """,
+                    (subject_id, min_ws, max_we),
+                ).fetchall()
     except psycopg.Error as error:
+        _reset_db()
         raise HTTPException(
             status_code=503,
             detail="Không đọc được dữ liệu từ PostgreSQL (hãy kiểm tra container postgres).",
@@ -866,7 +1113,7 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
 
     spark_points = _pivot_spark_rows(spark_raw)
     preds_chrono: list[dict[str, Any]] = []
-    for row in reversed(pred_rows):
+    for row in selected_preds:
         item = {
             "subject_id": row["subject_id"],
             "window_start": _iso_utc(row["window_start"]),
@@ -886,37 +1133,14 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
         item["vitals"] = _backfill_legacy_vitals(item, spark_points)
         preds_chrono.append(item)
 
-    # Filter Spark 10s points to match the active time span around predictions if predictions exist
-    if preds_chrono and spark_points:
-        min_start = preds_chrono[0]["window_start"]
-        max_end = preds_chrono[-1]["window_end"]
-        aligned_spark = [
-            pt for pt in spark_points if pt["window_end_utc"] > min_start and pt["window_start_utc"] < max_end
-        ]
-        if aligned_spark:
-            spark_points = aligned_spark
-
-    # Fill missing 10s HR from overlapping 30s Edge vitals if older replays lacked HR channel
-    for pt in spark_points:
-        if pt["hr_bpm"] is None:
-            overlap = next(
-                (
-                    p
-                    for p in preds_chrono
-                    if p["window_start"] <= pt["window_start_utc"] and p["window_end"] >= pt["window_end_utc"]
-                ),
-                None,
-            )
-            if overlap and overlap["vitals"].get("hr_bpm") is not None:
-                pt["hr_bpm"] = overlap["vitals"]["hr_bpm"]
-
-    summary = _build_clinical_summary(preds_chrono, spark_points[-(limit * 3) :])
+    merged_10s = _merge_subwindow_fallbacks(preds_chrono, spark_points) if preds_chrono else spark_points
+    summary = _build_clinical_summary(preds_chrono, merged_10s, is_warming_up=is_active_stream)
     return {
         "mode": "live_stack",
         "subject_id": subject_id,
         "summary": summary,
         "predictions": preds_chrono,
-        "spark_series": spark_points[-(limit * 3) :],
+        "spark_series": merged_10s,
     }
 
 
@@ -937,7 +1161,7 @@ def save_feedback(request: FeedbackRequest) -> dict[str, Any]:
         "note": request.note.strip(),
     }
 
-    if DEMO_MODE or request.subject_id in demo_predictions:
+    if DEMO_MODE or (request.subject_id in demo_predictions and sessions.get(request.subject_id, {}).get("is_demo", DEMO_MODE)):
         with sessions_lock:
             demo_feedback[(request.subject_id, norm_iso)] = {
                 "verdict": request.verdict,
@@ -946,9 +1170,9 @@ def save_feedback(request: FeedbackRequest) -> dict[str, Any]:
         return payload
 
     try:
-        with db_connect() as connection:
-            ensure_db_extensions(connection)
-            connection.execute(
+        with _db_lock:
+            conn = _get_db()
+            conn.execute(
                 """
                 INSERT INTO prediction_feedback (subject_id, window_start, verdict, note, updated_at)
                 VALUES (%s, %s, %s, %s, NOW())
@@ -959,8 +1183,8 @@ def save_feedback(request: FeedbackRequest) -> dict[str, Any]:
                 """,
                 (request.subject_id, parsed_dt, request.verdict, request.note.strip()),
             )
-            connection.commit()
     except psycopg.Error as error:
+        _reset_db()
         raise HTTPException(status_code=503, detail="Could not save user feedback") from error
     return payload
 

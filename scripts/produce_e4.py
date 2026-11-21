@@ -95,7 +95,8 @@ def main() -> int:
             bootstrap_servers=args.broker,
             acks="all",
             retries=5,
-            linger_ms=10,
+            linger_ms=15,
+            batch_size=65536,
         )
         already_sliced = False
         if args.source == "pickle":
@@ -109,6 +110,9 @@ def main() -> int:
         else:
             records = iter_subject_samples(subject_dir, tuple(args.sensors))
         last_future = None
+        stream_start_event_time: float | None = None
+        wall_start_perf: float | None = None
+        encoded_key = args.subject.encode("utf-8")
         for record in records:
             event_time = datetime.fromisoformat(
                 str(record["timestamp"]).replace("Z", "+00:00")
@@ -124,21 +128,27 @@ def main() -> int:
                     continue
                 if segment_end is not None and event_time >= segment_end:
                     break
-            if previous_timestamp is not None:
-                wait_seconds = max(0.0, (event_time - previous_timestamp) / args.speed)
-                if wait_seconds:
-                    time.sleep(wait_seconds)
-            previous_timestamp = event_time
+
+            # Wall-clock batch pacing: avoids Windows 15.6ms timer granularity penalty on per-sample sleep
+            if stream_start_event_time is None:
+                stream_start_event_time = event_time
+                wall_start_perf = time.perf_counter()
+            else:
+                assert wall_start_perf is not None
+                target_elapsed = (event_time - stream_start_event_time) / args.speed
+                actual_elapsed = time.perf_counter() - wall_start_perf
+                ahead_sec = target_elapsed - actual_elapsed
+                if ahead_sec >= 0.030:
+                    time.sleep(ahead_sec)
 
             last_future = producer.send(
                 args.topic,
-                key=args.subject.encode("utf-8"),
+                key=encoded_key,
                 value=json.dumps(record, separators=(",", ":")).encode("utf-8"),
             )
             sent += 1
-            if sent % 250 == 0:
+            if sent % 1000 == 0:
                 last_future.get(timeout=30)
-            if sent % 100 == 0:
                 print(f"Đã gửi {sent:,} mẫu; mẫu mới nhất: {record['sensor']} @ {record['timestamp']}")
             if args.limit and sent >= args.limit:
                 break

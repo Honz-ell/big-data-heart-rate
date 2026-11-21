@@ -58,6 +58,33 @@ def test_estimate_pulse_from_bvp_resting_and_tachycardia() -> None:
     assert res_stress["hrv_rmssd_ms"] is not None
     assert float(res_stress["hrv_rmssd_ms"]) < float(res_calm["hrv_rmssd_ms"])
 
+    # Inject large wrist motion spikes (+450 / -480) and verify MAD + FFT prevents sub-harmonic drop
+    corrupted = bvp_stress.copy()
+    corrupted[200:215] = 450.0
+    corrupted[800:812] = -480.0
+    res_noisy = estimate_pulse_from_bvp(corrupted, sample_rate_hz=64.0)
+    assert res_noisy["hr_bpm"] is not None
+    assert 100.0 <= float(res_noisy["hr_bpm"]) <= 116.0
+
+
+def test_latest_contiguous_segment_prevents_multi_hour_chart_squish() -> None:
+    from scripts.device_manager_api import _extract_latest_contiguous_segment
+
+    # Simulate DB rows from 08:33, 09:35 (older runs), and a newest run at 08:38:40..08:40:10
+    rows = [
+        {"window_start": "2017-06-13T08:39:40+00:00", "created_at": "2026-11-21T15:30:06+00:00"},
+        {"window_start": "2017-06-13T08:39:10+00:00", "created_at": "2026-11-21T15:30:04+00:00"},
+        {"window_start": "2017-06-13T08:38:40+00:00", "created_at": "2026-11-21T15:30:02+00:00"},
+        {"window_start": "2017-06-13T09:35:10+00:00", "created_at": "2026-11-21T15:28:00+00:00"},
+        {"window_start": "2017-06-13T08:33:40+00:00", "created_at": "2026-11-21T15:25:00+00:00"},
+    ]
+    seg = _extract_latest_contiguous_segment(rows, max_windows=24)
+    assert [r["window_start"] for r in seg] == [
+        "2017-06-13T08:38:40+00:00",
+        "2017-06-13T08:39:10+00:00",
+        "2017-06-13T08:39:40+00:00",
+    ]
+
 
 def test_pickle_reader_synthesizes_hr_stream_and_slices_offset(tmp_path: Path) -> None:
     subj_dir = tmp_path / "S4"

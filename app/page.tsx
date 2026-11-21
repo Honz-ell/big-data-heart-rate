@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const DEVICE_API = "/api/device";
 const REGISTRY_API = "/api/registry";
@@ -204,7 +204,9 @@ export default function HomePage() {
   );
 
   const isStreaming =
+    currentDevice?.producer_status === "starting" ||
     currentDevice?.producer_status === "running" ||
+    currentDevice?.edge_status === "starting" ||
     (currentDevice?.mode === "demo_replay" && currentDevice?.edge_status === "running");
 
   const activeModel = useMemo(
@@ -212,34 +214,9 @@ export default function HomePage() {
     [models]
   );
 
-  const refreshData = useCallback(async () => {
-    try {
-      const [healthRes, devRes, tlRes] = await Promise.all([
-        fetch(`${DEVICE_API}/health`, { cache: "no-store" }),
-        fetch(`${DEVICE_API}/devices`, { cache: "no-store" }),
-        fetch(`${DEVICE_API}/devices/${selectedSubject}/timeline?limit=24`, { cache: "no-store" }),
-      ]);
-      if (healthRes.ok) {
-        const h = await healthRes.json();
-        setApiOnline(true);
-        if (h.mode === "demo_replay" || h.mode === "live_stack") {
-          setBackendMode(h.mode);
-        }
-      } else {
-        setApiOnline(false);
-      }
-      if (devRes.ok) {
-        setDevices((await devRes.json()) as DeviceSession[]);
-      }
-      if (tlRes.ok) {
-        const data = (await tlRes.json()) as TimelineResponse;
-        setTimeline(data);
-        setBackendMode(data.mode);
-      }
-    } catch {
-      setApiOnline(false);
-    }
+  const inFlightRef = useRef(false);
 
+  const refreshRegistry = useCallback(async () => {
     try {
       const regRes = await fetch(`${REGISTRY_API}/models`, { cache: "no-store" });
       if (regRes.ok) {
@@ -250,6 +227,33 @@ export default function HomePage() {
       }
     } catch {
       setRegistryOnline(false);
+    }
+  }, []);
+
+  const refreshData = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      const [devRes, tlRes] = await Promise.all([
+        fetch(`${DEVICE_API}/devices`, { cache: "no-store" }),
+        fetch(`${DEVICE_API}/devices/${selectedSubject}/timeline?limit=20`, { cache: "no-store" }),
+      ]);
+      if (devRes.ok) {
+        setDevices((await devRes.json()) as DeviceSession[]);
+        setApiOnline(true);
+      } else {
+        setApiOnline(false);
+      }
+      if (tlRes.ok) {
+        const data = (await tlRes.json()) as TimelineResponse;
+        setTimeline(data);
+        setBackendMode(data.mode);
+        setApiOnline(true);
+      }
+    } catch {
+      setApiOnline(false);
+    } finally {
+      inFlightRef.current = false;
     }
   }, [selectedSubject]);
 
@@ -274,8 +278,16 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
+    void refreshRegistry();
+    const regTimer = window.setInterval(() => {
+      void refreshRegistry();
+    }, 12000);
+    return () => window.clearInterval(regTimer);
+  }, [refreshRegistry]);
+
+  useEffect(() => {
     void refreshData();
-    const pollMs = isStreaming ? 1000 : 2800;
+    const pollMs = isStreaming ? 1600 : 3500;
     const timer = window.setInterval(() => {
       void refreshData();
     }, pollMs);
@@ -395,9 +407,27 @@ export default function HomePage() {
         const body = await res.json();
         throw new Error(body.detail ?? "Không đổi được phiên bản model.");
       }
-      await refreshData();
+      await Promise.all([refreshRegistry(), refreshData()]);
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : "Lỗi gọi Model Registry.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function clearHistory() {
+    setBusyAction("clear");
+    setErrorBanner(null);
+    try {
+      const res = await fetch(`${DEVICE_API}/devices/${selectedSubject}/history`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        setSelectedWindowKey(null);
+        await refreshData();
+      }
+    } catch {
+      setErrorBanner("Không xóa được lịch sử phiên đo.");
     } finally {
       setBusyAction(null);
     }
@@ -934,7 +964,7 @@ export default function HomePage() {
                 </div>
               </div>
 
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
                 {(
                   [
                     ["hr", "Nhịp tim (BPM)"],
@@ -953,6 +983,15 @@ export default function HomePage() {
                     {label}
                   </button>
                 ))}
+                <button
+                  type="button"
+                  style={{ padding: "6px 10px", fontSize: 12, color: "var(--muted)" }}
+                  disabled={busyAction !== null || isStreaming}
+                  onClick={() => void clearHistory()}
+                  title="Xóa các bản ghi cũ của người đeo này trong cơ sở dữ liệu"
+                >
+                  Làm mới lịch sử
+                </button>
               </div>
             </div>
 
@@ -961,6 +1000,7 @@ export default function HomePage() {
               sparkSeries={sparkSeries}
               metric={chartMetric}
               baselineHr={summary?.baseline_hr_bpm ?? 72}
+              isStreaming={isStreaming}
               selectedWindowStart={selectedWindow?.window_start ?? null}
               onSelectWindow={(ws) => setSelectedWindowKey(ws)}
             />
@@ -1598,6 +1638,7 @@ function DualTimelineChart({
   sparkSeries,
   metric,
   baselineHr,
+  isStreaming,
   selectedWindowStart,
   onSelectWindow,
 }: {
@@ -1605,6 +1646,7 @@ function DualTimelineChart({
   sparkSeries: SparkPoint[];
   metric: ChartMetric;
   baselineHr: number;
+  isStreaming: boolean;
   selectedWindowStart: string | null;
   onSelectWindow: (windowStart: string) => void;
 }) {
@@ -1618,19 +1660,21 @@ function DualTimelineChart({
           border: "1px dashed var(--border)",
           borderRadius: 8,
           color: "var(--muted)",
-          fontSize: 13,
+          fontSize: 13.5,
         }}
       >
-        Chưa có dữ liệu chuỗi thời gian — hãy chọn một kịch bản ở trên để phát luồng cảm biến.
+        {isStreaming
+          ? "● Đang phát mẫu cảm biến qua Kafka và tổng hợp cửa sổ 10s / 30s đầu tiên..."
+          : "Chưa có dữ liệu chuỗi thời gian — hãy chọn một kịch bản ở trên để phát luồng cảm biến."}
       </div>
     );
   }
 
   const width = 980;
-  const height = 248;
+  const height = 256;
   const padL = 52;
-  const padR = 20;
-  const padT = 18;
+  const padR = 24;
+  const padT = 22;
   const padB = 34;
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
@@ -1643,11 +1687,10 @@ function DualTimelineChart({
     allTimes.push(new Date(s.window_start_utc).getTime(), new Date(s.window_end_utc).getTime());
   }
   const minT = Math.min(...allTimes);
-  const maxT = Math.max(minT + 10_000, ...allTimes);
+  const maxT = Math.max(minT + 30_000, ...allTimes);
 
   const xOf = (ms: number) => padL + ((ms - minT) / (maxT - minT)) * plotW;
 
-  // Build metric series points from 10s Spark series (or 30s Edge vitals for Stress Load)
   const points: { t: number; v: number; label: string }[] = [];
   if (metric === "load") {
     for (const p of predictions) {
@@ -1665,7 +1708,6 @@ function DualTimelineChart({
         points.push({ t: mid, v: raw, label: String(raw) });
       }
     }
-    // Fallback to 30s vitals if Spark table is empty
     if (points.length === 0) {
       for (const p of predictions) {
         const mid = (new Date(p.window_start).getTime() + new Date(p.window_end).getTime()) / 2;
@@ -1690,7 +1732,7 @@ function DualTimelineChart({
   if (metric === "hr") {
     const vals = points.map((p) => p.v).concat([baselineHr]);
     yMin = Math.floor(Math.min(58, ...vals) - 4);
-    yMax = Math.ceil(Math.max(115, ...vals) + 6);
+    yMax = Math.ceil(Math.max(115, ...vals) + 8);
     unit = "BPM";
     lineColor = "#5eead4";
   } else if (metric === "eda") {
@@ -1717,8 +1759,35 @@ function DualTimelineChart({
     return padT + plotH - ((clamped - yMin) / Math.max(1e-6, yMax - yMin)) * plotH;
   };
 
-  const polyPoints = points.map((pt) => `${xOf(pt.t).toFixed(1)},${yOf(pt.v).toFixed(1)}`).join(" ");
+  // Break polyline across non-contiguous gaps (> 40s) so unrelated segments never bridge with a straight line
+  const maxGapMs = metric === "load" ? 65_000 : 35_000;
+  const lineSegments: string[] = [];
+  let currentSeg: string[] = [];
+  for (let i = 0; i < points.length; i += 1) {
+    if (i > 0 && points[i].t - points[i - 1].t > maxGapMs) {
+      if (currentSeg.length > 1) lineSegments.push(currentSeg.join(" "));
+      currentSeg = [];
+    }
+    currentSeg.push(`${xOf(points[i].t).toFixed(1)},${yOf(points[i].v).toFixed(1)}`);
+  }
+  if (currentSeg.length > 1) lineSegments.push(currentSeg.join(" "));
+
   const yTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => yMin + f * (yMax - yMin));
+
+  // Collision-free X-axis timestamp ticks
+  const xTickLabels: { key: string; x: number; text: string }[] = [];
+  let lastTickX = -999;
+  for (const pred of predictions) {
+    const x = xOf(new Date(pred.window_start).getTime());
+    if (x - lastTickX >= 84 && x <= width - padR - 46) {
+      xTickLabels.push({
+        key: pred.window_start,
+        x,
+        text: fmtClock(pred.window_start),
+      });
+      lastTickX = x;
+    }
+  }
 
   return (
     <div style={{ width: "100%", overflowX: "auto" }}>
@@ -1737,10 +1806,11 @@ function DualTimelineChart({
           const isMotion = pred.vitals.activity_state === "HIGH_ACTIVITY";
           const isSel = selectedWindowStart === pred.window_start;
           const fill = isStress
-            ? "rgba(235, 94, 77, 0.20)"
+            ? "rgba(235, 94, 77, 0.19)"
             : isMotion
               ? "rgba(75, 163, 227, 0.14)"
               : "rgba(56, 178, 154, 0.07)";
+          const topBarColor = isStress ? "#eb5e4d" : isMotion ? "#4ba3e3" : "#38b29a";
 
           return (
             <g
@@ -1757,16 +1827,19 @@ function DualTimelineChart({
                 stroke={isSel ? "#edf4f1" : "rgba(255,255,255,0.06)"}
                 strokeWidth={isSel ? 1.5 : 0.6}
               />
-              <text
-                x={x1 + w / 2}
-                y={padT + 13}
-                textAnchor="middle"
-                fill={isStress ? "#ff9c90" : isMotion ? "#8fd0ff" : "#7fd8c5"}
-                fontSize={9.5}
-                fontWeight={700}
-              >
-                {isStress ? "STRESS" : isMotion ? "VẬN ĐỘNG" : "ỔN ĐỊNH"}
-              </text>
+              <rect x={x1} y={padT} width={w} height={3} fill={topBarColor} opacity={0.85} />
+              {w >= 58 && (
+                <text
+                  x={x1 + w / 2}
+                  y={padT + 16}
+                  textAnchor="middle"
+                  fill={isStress ? "#ff9c90" : isMotion ? "#8fd0ff" : "#7fd8c5"}
+                  fontSize={9.5}
+                  fontWeight={700}
+                >
+                  {isStress ? "STRESS" : isMotion ? "VẬN ĐỘNG" : "ỔN ĐỊNH"}
+                </text>
+              )}
             </g>
           );
         })}
@@ -1810,9 +1883,9 @@ function DualTimelineChart({
               strokeDasharray="5 4"
             />
             <text
-              x={width - padR - 4}
-              y={yOf(baselineHr) - 5}
-              textAnchor="end"
+              x={padL + 8}
+              y={Math.max(padT + 28, yOf(baselineHr) - 5)}
+              textAnchor="start"
               fill="#f6cb72"
               fontSize={10}
             >
@@ -1821,17 +1894,18 @@ function DualTimelineChart({
           </g>
         )}
 
-        {/* 10s Spark Continuous Line + Dots */}
-        {points.length > 1 && (
+        {/* 10s Spark Continuous Line Segments + Dots */}
+        {lineSegments.map((segPts, idx) => (
           <polyline
+            key={`seg-${idx}`}
             fill="none"
             stroke={lineColor}
             strokeWidth={2.5}
             strokeLinejoin="round"
             strokeLinecap="round"
-            points={polyPoints}
+            points={segPts}
           />
-        )}
+        ))}
 
         {points.map((pt, idx) => (
           <circle
@@ -1848,23 +1922,17 @@ function DualTimelineChart({
         ))}
 
         {/* X-axis timestamps */}
-        {predictions.map((pred, idx) => {
-          if (predictions.length > 8 && idx % 2 !== 0 && idx !== predictions.length - 1) {
-            return null;
-          }
-          const x = xOf(new Date(pred.window_start).getTime());
-          return (
-            <text
-              key={`lbl-${pred.window_start}`}
-              x={x + 2}
-              y={height - 10}
-              fill="#93a7a0"
-              fontSize={10.5}
-            >
-              {fmtClock(pred.window_start)}
-            </text>
-          );
-        })}
+        {xTickLabels.map((lbl) => (
+          <text
+            key={`lbl-${lbl.key}`}
+            x={lbl.x + 2}
+            y={height - 10}
+            fill="#93a7a0"
+            fontSize={10.5}
+          >
+            {lbl.text}
+          </text>
+        ))}
       </svg>
     </div>
   );

@@ -58,16 +58,16 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
     },
     {
         "id": "physical_activity_check",
-        "title": "Đi bộ nhanh / Leo cầu thang (Chống báo giả)",
+        "title": "Di chuyển nhanh / Chuyển pha (Chống báo giả)",
         "badge": "Vận động",
         "tone": "motion",
         "subject_id": "S4",
-        "start_offset_seconds": 2100,
-        "duration_seconds": 180,
-        "speed": 30,
+        "start_offset_seconds": 3540,
+        "duration_seconds": 150,
+        "speed": 35,
         "description": (
-            "Nhịp tim tăng lên 118–128 BPM kèm gia tốc cổ tay (ACC) dao động lớn: "
-            "minh họa cách đa cảm biến phân biệt tập thể dục với căng thẳng tâm lý lúc nghỉ."
+            "Giai đoạn đi bộ / cử động tay liên tục trước bài thi: gia tốc cổ tay (ACC) dao động lớn, "
+            "minh họa cách đa cảm biến phân biệt vận động thể chất với căng thẳng tâm lý lúc ngồi tĩnh."
         ),
         "expected_outcome": "Gắn nhãn 'Đang vận động' · Không báo động nhầm nhịp tim bất thường",
     },

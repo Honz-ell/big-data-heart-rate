@@ -181,7 +181,6 @@ def main() -> None:
             & F.col("event_time").isNotNull()
             & valid_measurement
         )
-        .withWatermark("event_time", args.watermark)
     )
 
     aggregates = (
@@ -208,14 +207,14 @@ def main() -> None:
     )
 
     query = (
-        aggregates.writeStream.outputMode("append")
+        aggregates.writeStream.outputMode("update")
         .foreachBatch(
             lambda batch_df, batch_id: write_microbatch_to_postgres(
                 batch_df, batch_id, args
             )
         )
         .option("checkpointLocation", args.checkpoint_location)
-        .trigger(processingTime="5 seconds")
+        .trigger(processingTime="2 seconds")
         .start()
     )
     metrics_server = ThreadingHTTPServer(
