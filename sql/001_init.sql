@@ -7,9 +7,13 @@ CREATE TABLE IF NOT EXISTS stress_predictions (
     model_file TEXT NOT NULL,
     model_version TEXT,
     sample_counts JSONB NOT NULL,
+    vitals JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (subject_id, window_start)
 );
+
+ALTER TABLE stress_predictions
+    ADD COLUMN IF NOT EXISTS vitals JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_stress_predictions_window_start
     ON stress_predictions (window_start DESC);
@@ -30,6 +34,18 @@ CREATE TABLE IF NOT EXISTS sensor_window_aggregates (
 
 CREATE INDEX IF NOT EXISTS idx_sensor_window_aggregates_time
     ON sensor_window_aggregates (window_start_utc DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sensor_window_aggregates_subject_time
+    ON sensor_window_aggregates (subject_id, window_start_utc DESC);
+
+CREATE TABLE IF NOT EXISTS prediction_feedback (
+    subject_id TEXT NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('ACCURATE', 'FALSE_ALARM')),
+    note TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (subject_id, window_start)
+);
 
 CREATE TABLE IF NOT EXISTS model_versions (
     version TEXT PRIMARY KEY,

@@ -51,7 +51,7 @@ def recording_origin_utc(e4_dir: Path) -> datetime:
         with path.open("r", newline="", encoding="utf-8-sig") as handle:
             first = next(csv.reader(handle), None)
         if not first or not first[0].strip():
-            raise ValueError(f"Header waktu tidak ditemukan di {path}")
+            raise ValueError(f"Không tìm thấy mốc thời gian header trong {path}")
         starts.append(float(first[0]))
     return datetime.fromtimestamp(min(starts), timezone.utc)
 
@@ -59,7 +59,7 @@ def recording_origin_utc(e4_dir: Path) -> datetime:
 def main() -> int:
     args = parse_args()
     if args.window_seconds <= 0 or not 0.5 <= args.min_purity <= 1 or args.limit < 1:
-        print("Window harus >0, min-purity 0.5–1.0, dan limit minimal 1.")
+        print("Tham số không hợp lệ: window-seconds > 0, min-purity trong [0.5, 1.0] và limit >= 1.")
         return 2
 
     subject_dir = args.data_root / args.subject

@@ -95,41 +95,55 @@ def main() -> int:
             bootstrap_servers=args.broker,
             acks="all",
             retries=5,
+            linger_ms=10,
         )
+        already_sliced = False
         if args.source == "pickle":
-            records = iter_pickle_sensor_samples(subject_dir, tuple(args.sensors))
+            records = iter_pickle_sensor_samples(
+                subject_dir,
+                tuple(args.sensors),
+                start_offset_seconds=args.start_offset_seconds,
+                duration_seconds=args.duration_seconds,
+            )
+            already_sliced = True
         else:
             records = iter_subject_samples(subject_dir, tuple(args.sensors))
+        last_future = None
         for record in records:
             event_time = datetime.fromisoformat(
                 str(record["timestamp"]).replace("Z", "+00:00")
             ).timestamp()
-            if recording_origin is None:
-                recording_origin = event_time
-                segment_start = recording_origin + args.start_offset_seconds
-                if args.duration_seconds:
-                    segment_end = segment_start + args.duration_seconds
-            assert segment_start is not None
-            if event_time < segment_start:
-                continue
-            if segment_end is not None and event_time >= segment_end:
-                break
+            if not already_sliced:
+                if recording_origin is None:
+                    recording_origin = event_time
+                    segment_start = recording_origin + args.start_offset_seconds
+                    if args.duration_seconds:
+                        segment_end = segment_start + args.duration_seconds
+                assert segment_start is not None
+                if event_time < segment_start:
+                    continue
+                if segment_end is not None and event_time >= segment_end:
+                    break
             if previous_timestamp is not None:
                 wait_seconds = max(0.0, (event_time - previous_timestamp) / args.speed)
                 if wait_seconds:
                     time.sleep(wait_seconds)
             previous_timestamp = event_time
 
-            producer.send(
+            last_future = producer.send(
                 args.topic,
                 key=args.subject.encode("utf-8"),
                 value=json.dumps(record, separators=(",", ":")).encode("utf-8"),
-            ).get(timeout=30)
+            )
             sent += 1
+            if sent % 250 == 0:
+                last_future.get(timeout=30)
             if sent % 100 == 0:
                 print(f"Đã gửi {sent:,} mẫu; mẫu mới nhất: {record['sensor']} @ {record['timestamp']}")
             if args.limit and sent >= args.limit:
                 break
+        if last_future is not None:
+            last_future.get(timeout=30)
     except KeyboardInterrupt:
         print("Đã nhận Ctrl+C, đang hoàn tất các bản ghi còn trong hàng đợi.")
     except Exception as error:

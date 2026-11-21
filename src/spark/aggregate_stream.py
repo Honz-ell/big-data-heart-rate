@@ -164,8 +164,11 @@ def main() -> None:
     acc_y = F.get_json_object("value_json", "$.y").cast("double")
     acc_z = F.get_json_object("value_json", "$.z").cast("double")
     acc_magnitude = F.sqrt(F.pow(acc_x, 2) + F.pow(acc_y, 2) + F.pow(acc_z, 2))
-    valid_measurement = F.col("measurement").isNotNull() & (
-        (F.col("sensor") != "TEMP") | F.col("measurement").between(20.0, 45.0)
+    valid_measurement = (
+        F.col("measurement").isNotNull()
+        & ((F.col("sensor") != "TEMP") | F.col("measurement").between(20.0, 45.0))
+        & ((F.col("sensor") != "HR") | F.col("measurement").between(35.0, 210.0))
+        & ((F.col("sensor") != "EDA") | F.col("measurement").between(0.0, 60.0))
     )
 
     measurable = (

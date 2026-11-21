@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.pyc
 node_modules/
@@ -16,3 +16,4 @@ scripts/runtime/**
 *.pickle
 *.log
 *.crc
+.pytest_cache/

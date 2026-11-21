@@ -289,26 +289,66 @@ WHERE subject_id = 'S4' AND sensor = 'TEMP'
 ORDER BY window_start_utc;
 ```
 
+## Giao diện Web theo dõi sức khỏe & vận hành (WESAD Pulse & Stress Companion)
+
+Giao diện Next.js cung cấp **2 góc nhìn song song** trên cùng một luồng dữ liệu:
+
+1. **Tab Theo dõi Sức khỏe & Cảnh báo (hướng người dùng đeo đồng hồ)**:
+   - Hiển thị các chỉ số sinh tồn dễ hiểu: **Nhịp tim hiện tại (`BPM` so với mức nền nghỉ cá nhân)**, **Biến thiên nhịp tim (`HRV · RMSSD` bằng ms)**, **Chỉ số Căng thẳng Tổng hợp (`0–100`)**, **Độ dẫn điện da (`EDA µS`)**, **Nhiệt độ cổ tay (`°C`)** và **Bối cảnh vận động (`Ngồi tĩnh` / `Vận động nhẹ` / `Đang vận động mạnh`)**.
+   - **Biểu đồ sinh lý đa tốc độ**: kết hợp trực tiếp đường chỉ số sinh tồn mỗi **10 giây từ Spark Structured Streaming (`sensor_window_aggregates`)** với các vùng phân loại **30 giây từ AI tại Edge (`stress_predictions`)**.
+   - **Chống báo động giả & cảnh báo có giải thích**: tự động khóa cảnh báo stress giả khi gia tốc cổ tay ghi nhận đang tập thể dục/đi bộ nhanh; chỉ kích hoạt cảnh báo căng thẳng kéo dài khi vượt ngưỡng liên tiếp qua nhiều cửa sổ, kèm mã lý do sinh lý tiếng Việt, bài hít thở điều hòa `4-4-6` và nút xác nhận phản hồi người đeo (`prediction_feedback`).
+   - **4 kịch bản mẫu 1-Click** (*Làm việc thư giãn*, *Áp lực thuyết trình TSST*, *Chuyển pha Áp lực → Phục hồi*, *Đi bộ nhanh / Chống báo giả*).
+2. **Tab Vận hành Pipeline & Model Registry (hướng kỹ sư dữ liệu / MLOps)**:
+   - Tùy chỉnh `offset`, `duration`, `speed`, theo dõi log trực tiếp của `produce_e4.py` và `edge_inference.py`, kiểm tra bảng micro-batch 10s của Spark và chuyển đổi nóng (hot-swap) phiên bản mô hình `v1.0.0 ↔ v1.1.0`.
+
+### Chạy với cụm Docker đầy đủ (Kafka + Spark + PostgreSQL)
+
+Sau khi bật `docker compose --profile monitoring up -d --build`, mở thêm 2 terminal:
+
+```powershell
+# Terminal 1: Khởi chạy Device Manager & Health Telemetry API trên cổng 8001
+.\.venv\Scripts\python.exe -m uvicorn scripts.device_manager_api:app --host 0.0.0.0 --port 8001
+```
+
+```powershell
+# Terminal 2: Khởi chạy giao diện Next.js trên cổng 3001
+npm install
+npm run dev
+```
+
+Mở trình duyệt tại [http://localhost:3001](http://localhost:3001). Next.js tự động proxy `/api/device/*` sang `:8001` và `/api/registry/*` sang `:8000`.
+
+### Chế độ Trình diễn Nhanh không cần dữ liệu 2.5 GB (`WESAD_DEMO_MODE=1`)
+
+Khi muốn trình diễn nhanh giao diện hoặc kiểm thử trên máy chưa tải bộ WESAD 2.5 GB, bật biến môi trường `WESAD_DEMO_MODE=1` (vẫn chạy mô hình Random Forest thật trong `models/` trên sóng sinh lý E4 tổng hợp):
+
+```powershell
+$env:WESAD_DEMO_MODE="1"
+.\.venv\Scripts\python.exe -m uvicorn wesad.model_registry:app --app-dir src --host 0.0.0.0 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn scripts.device_manager_api:app --host 0.0.0.0 --port 8001
+npm run dev
+```
+
 ## Cấu trúc
 
 ```text
-src/wesad/e4_reader.py   Đọc từng mẫu E4, không nạp toàn bộ cảm biến vào RAM
-scripts/inspect_dataset.py Kiểm kê thư mục dataset
-scripts/produce_e4.py   Phát lại dữ liệu mẫu vào Kafka
-src/wesad/pickle_reader.py Phát tín hiệu wrist pickle đã đồng bộ
-scripts/list_stress_windows.py Tìm các cửa sổ nhãn Stress để demo
+src/wesad/e4_reader.py        Đọc từng mẫu E4 CSV, không nạp toàn bộ cảm biến vào RAM
+src/wesad/pickle_reader.py    Phát tín hiệu wrist pickle đồng bộ + suy diễn kênh HR 1 Hz từ BVP
+src/wesad/features.py         Định nghĩa 16 đặc trưng miền thời gian dùng chung cho train và Edge
+src/wesad/vitals.py           Trích xuất nhịp tim (BPM), HRV (RMSSD), bối cảnh vận động & mã giải thích
+src/wesad/demo_simulator.py   Danh mục 4 kịch bản thực tế & bộ phát sóng E4 cho chế độ trình diễn
+src/wesad/model_registry.py   FastAPI Model Registry quản lý phiên bản, SHA-256 và hot-swap model
+src/spark/aggregate_stream.py Spark đọc Kafka, tổng hợp cửa sổ 10 giây và xuất Prometheus metrics
+scripts/inspect_dataset.py    Kiểm kê thư mục dataset WESAD
+scripts/produce_e4.py         Phát lại dữ liệu đa cảm biến vào Kafka
+scripts/list_stress_windows.py Tìm các cửa sổ nhãn Stress/Non-Stress thuần để demo
 scripts/compare_e4_pickle_window.py So sánh đặc trưng giữa pickle và E4 CSV
-compose.yaml             Kafka, PostgreSQL, Grafana, Spark, Prometheus và exporter
-sql/001_init.sql         Bảng lưu các cửa sổ dự đoán trong PostgreSQL
-grafana/provisioning/    Datasource PostgreSQL và Prometheus cho Grafana
-grafana/system-monitoring.json Dashboard Prometheus cho Kafka, Spark và container
-grafana/prometheus.yml   Cấu hình scrape metrics từ các exporter
-grafana/kafka-jmx.yml    Ánh xạ Kafka JMX metrics sang Prometheus
-src/spark/aggregate_stream.py Spark đọc Kafka, tổng hợp cửa sổ và xuất metrics
-scripts/train_stress_model.py Huấn luyện baseline bằng nhãn WESAD và đánh giá theo người
-scripts/edge_inference.py   Mô phỏng từng thiết bị Edge đọc Kafka và dự đoán theo cửa sổ
-scripts/device_manager_api.py API điều khiển các phiên Producer/Edge cho giao diện
-app/                       Giao diện Next.js để khởi chạy thiết bị và xem dự đoán
-src/wesad/features.py       Định nghĩa đặc trưng dùng chung cho train và Edge
-docs/data-contract.md    Định dạng sự kiện dùng giữa các thành phần
+scripts/train_stress_model.py Huấn luyện Random Forest với đánh giá Leave-One-Subject-Out
+scripts/edge_inference.py     Thiết bị Edge đọc Kafka, dự đoán cửa sổ 30s + vitals vào PostgreSQL
+scripts/device_manager_api.py API điều khiển phiên phát & hợp nhất timeline Spark 10s + Edge 30s
+app/                          Giao diện Next.js 2 tab (Theo dõi sức khỏe cá nhân & Vận hành MLOps)
+sql/001_init.sql              Schema PostgreSQL (stress_predictions, sensor_window_aggregates, feedback)
+compose.yaml                  Kafka, PostgreSQL, Grafana, Spark, Model Registry, Prometheus, cAdvisor
+grafana/                      Provisioning datasource và dashboard giám sát hạ tầng Prometheus
+docs/data-contract.md         Định dạng sự kiện wearable.sensor.v1 giữa các thành phần
 ```
