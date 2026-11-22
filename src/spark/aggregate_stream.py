@@ -175,22 +175,29 @@ def main() -> None:
         F.get_json_object("json", "$.value").alias("value_json"),
     )
 
-    scalar_value = F.col("value_json").cast("double")
-    acc_x = F.get_json_object("value_json", "$.x").cast("double")
-    acc_y = F.get_json_object("value_json", "$.y").cast("double")
-    acc_z = F.get_json_object("value_json", "$.z").cast("double")
+    scalar_value = F.expr("try_cast(value_json AS DOUBLE)")
+    ibi_interval = F.coalesce(
+        F.expr("try_cast(get_json_object(value_json, '$.interval') AS DOUBLE)"),
+        scalar_value,
+    )
+    acc_x = F.expr("try_cast(get_json_object(value_json, '$.x') AS DOUBLE)")
+    acc_y = F.expr("try_cast(get_json_object(value_json, '$.y') AS DOUBLE)")
+    acc_z = F.expr("try_cast(get_json_object(value_json, '$.z') AS DOUBLE)")
     acc_magnitude = F.sqrt(F.pow(acc_x, 2) + F.pow(acc_y, 2) + F.pow(acc_z, 2))
     valid_measurement = (
         F.col("measurement").isNotNull()
         & ((F.col("sensor") != "TEMP") | F.col("measurement").between(20.0, 45.0))
         & ((F.col("sensor") != "HR") | F.col("measurement").between(35.0, 210.0))
         & ((F.col("sensor") != "EDA") | F.col("measurement").between(0.0, 60.0))
+        & ((F.col("sensor") != "IBI") | F.col("measurement").between(0.30, 2.00))
     )
 
     measurable = (
         events.withColumn(
             "measurement",
-            F.when(F.col("sensor") == "ACC", acc_magnitude).otherwise(scalar_value),
+            F.when(F.col("sensor") == "ACC", acc_magnitude)
+            .when(F.col("sensor") == "IBI", ibi_interval)
+            .otherwise(scalar_value),
         )
         .where(
             F.col("subject_id").isNotNull()
