@@ -128,10 +128,10 @@ export function SystemModelTab({
 }: {
   data: SystemTelemetryData;
   isFlowing: boolean;
-  onActivateModel: (version: string) => Promise<void>;
+  onActivateModel: (version: string) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const [activatingVer, setActivatingVer] = useState<string | null>(null);
-  const [swapToast, setSwapToast] = useState<string | null>(null);
+  const [swapToast, setSwapToast] = useState<{ text: string; isError: boolean } | null>(null);
   const [logsExpanded, setLogsExpanded] = useState<boolean>(false);
 
   const activeVer = data.models.find((m) => m.isActive)?.version ?? "v1.0.0";
@@ -139,35 +139,55 @@ export function SystemModelTab({
   const handleHotSwap = async (version: string) => {
     setActivatingVer(version);
     try {
-      await onActivateModel(version);
-      setSwapToast(
-        `✓ Đã kích hoạt ${version} — Edge sẽ nhận model mới ở lần poll kế tiếp (≤ 5 giây) không dừng luồng!`
-      );
+      const res = await onActivateModel(version);
+      if (!res.ok) {
+        setSwapToast({
+          text: res.error ?? `Không thể kích hoạt ${version} trên Model Registry API.`,
+          isError: true,
+        });
+      } else {
+        setSwapToast({
+          text: `✓ Đã kích hoạt ${version} — Edge sẽ nhận model mới ở lần poll kế tiếp (≤ 5 giây) không dừng luồng!`,
+          isError: false,
+        });
+      }
       window.setTimeout(() => setSwapToast(null), 6000);
     } finally {
       setActivatingVer(null);
     }
   };
 
+  const promActive = data.metricsAvailable !== false;
+
   const pipelineNodes = [
     {
       title: "1. Đồng hồ E4",
       subtitle: "6 kênh cảm biến",
-      metric: `${data.liveNodes.sensorRatePerSec.toLocaleString()} mẫu/s`,
+      metric: promActive
+        ? `${data.liveNodes.sensorRatePerSec.toLocaleString()} mẫu/s`
+        : "Chưa thu thập",
       subMetric: "BVP 64Hz · ACC 32Hz · EDA/TEMP",
       accent: "var(--emerald)",
     },
     {
       title: "2. Apache Kafka",
       subtitle: "wearable.sensor.v1",
-      metric: `${data.liveNodes.kafkaRecordsPerSec.toLocaleString()} rec/s`,
+      metric: promActive
+        ? `${data.liveNodes.kafkaRecordsPerSec.toLocaleString()} rec/s`
+        : data.services.kafka === "healthy"
+          ? "TCP :9092 OK"
+          : "Mất kết nối",
       subMetric: "KRaft · Phân vùng theo subject_id",
       accent: "var(--sky)",
     },
     {
       title: "3. Spark Streaming",
       subtitle: "Cửa sổ 10s · Watermark 15s",
-      metric: `${Math.round(data.liveNodes.sparkBatchMs)} ms/batch`,
+      metric: promActive
+        ? `${Math.round(data.liveNodes.sparkBatchMs)} ms/batch`
+        : data.services.spark === "healthy"
+          ? "Spark :4040 OK"
+          : "Chờ batch",
       subMetric: `${data.liveNodes.sparkWindowsTotal.toLocaleString()} cửa sổ 10s`,
       accent: "var(--amber)",
     },
@@ -202,11 +222,11 @@ export function SystemModelTab({
           role="status"
           className="rounded-2xl px-5 py-3.5 text-sm font-extrabold shadow-lg flex items-center justify-between gap-3"
           style={{
-            backgroundColor: "var(--emerald)",
+            backgroundColor: swapToast.isError ? "var(--crimson)" : "var(--emerald)",
             color: "#ffffff",
           }}
         >
-          <span>⚡ {swapToast}</span>
+          <span>{swapToast.isError ? "⚠" : "⚡"} {swapToast.text}</span>
           <button
             type="button"
             onClick={() => setSwapToast(null)}

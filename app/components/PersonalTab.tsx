@@ -72,26 +72,26 @@ function StressGauge({
   return (
     <div className="flex flex-col items-center">
       <svg viewBox="0 0 220 128" className="w-56 h-32 overflow-visible" aria-label={`Chỉ số căng thẳng ${clamped} trên 100`}>
-        {/* Zone 1: 0..39 Green */}
+        {/* Zone 1: 0..34 Green */}
         <path
-          d={arcSegment(0, 39)}
+          d={arcSegment(0, 34)}
           fill="none"
           stroke="var(--emerald)"
           strokeWidth="16"
           strokeLinecap="round"
           opacity={0.88}
         />
-        {/* Zone 2: 41..59 Amber */}
+        {/* Zone 2: 36..49 Amber */}
         <path
-          d={arcSegment(41, 59)}
+          d={arcSegment(36, 49)}
           fill="none"
           stroke="var(--amber)"
           strokeWidth="16"
           opacity={0.88}
         />
-        {/* Zone 3: 61..100 Red */}
+        {/* Zone 3: 51..100 Red (matches RF >= 0.50 threshold) */}
         <path
-          d={arcSegment(61, 100)}
+          d={arcSegment(51, 100)}
           fill="none"
           stroke="var(--crimson)"
           strokeWidth="16"
@@ -103,11 +103,11 @@ function StressGauge({
         <text x="20" y="122" fontSize="10" fontWeight="700" fill="var(--muted)">
           0
         </text>
-        <text x="72" y="24" fontSize="10" fontWeight="700" fill="var(--muted)">
-          40
+        <text x="64" y="28" fontSize="10" fontWeight="700" fill="var(--muted)">
+          35
         </text>
-        <text x="138" y="24" fontSize="10" fontWeight="700" fill="var(--muted)">
-          60
+        <text x="105" y="18" fontSize="10" fontWeight="700" fill="var(--muted)">
+          50
         </text>
         <text x="188" y="122" fontSize="10" fontWeight="700" fill="var(--muted)">
           100
@@ -202,12 +202,17 @@ export function PersonalTab({
 }: {
   data: PersonalDashboardData;
   onOpenBreathing: () => void;
-  onSendFeedback: (verdict: "ACCURATE" | "FALSE_ALARM") => void;
+  onSendFeedback: (
+    verdict: "ACCURATE" | "FALSE_ALARM"
+  ) => Promise<{ ok: boolean; error?: string }>;
   onStartQuick: () => void;
 }) {
   const [rangeMinutes, setRangeMinutes] = useState<"5m" | "15m" | "all">("5m");
   const [chartMode, setChartMode] = useState<"both" | "hr" | "eda">("both");
-  const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
+  const [feedbackBanner, setFeedbackBanner] = useState<{
+    text: string;
+    isError: boolean;
+  } | null>(null);
 
   const latestWindow = data.edgeWindows.at(-1) ?? null;
 
@@ -297,13 +302,23 @@ export function PersonalTab({
   const hrvTrend =
     hrvVal === null ? "—" : hrvVal < 36 ? "↓" : hrvVal > 65 ? "↑" : "→";
 
-  const handleFeedback = (verdict: "ACCURATE" | "FALSE_ALARM") => {
-    onSendFeedback(verdict);
-    setFeedbackBanner(
-      verdict === "ACCURATE"
-        ? "Đã ghi nhận: 'Đúng, tôi đang căng thẳng' vào bảng prediction_feedback."
-        : "Đã ghi nhận: 'Báo nhầm' vào bảng prediction_feedback để cải thiện phiên bản model kế tiếp."
-    );
+  const handleFeedback = async (verdict: "ACCURATE" | "FALSE_ALARM") => {
+    const res = await onSendFeedback(verdict);
+    if (!res.ok) {
+      setFeedbackBanner({
+        text: res.error ?? "Không lưu được phản hồi vào bảng prediction_feedback.",
+        isError: true,
+      });
+      window.setTimeout(() => setFeedbackBanner(null), 5500);
+      return;
+    }
+    setFeedbackBanner({
+      text:
+        verdict === "ACCURATE"
+          ? "Đã ghi nhận: 'Đúng, tôi đang căng thẳng' vào bảng prediction_feedback."
+          : "Đã ghi nhận: 'Báo nhầm' vào bảng prediction_feedback để cải thiện phiên bản model kế tiếp.",
+      isError: false,
+    });
     window.setTimeout(() => setFeedbackBanner(null), 4500);
   };
 
@@ -317,7 +332,7 @@ export function PersonalTab({
               <span>Chỉ số căng thẳng (0–100)</span>
               <InfoTooltip
                 title="Chỉ số căng thẳng 0–100 là gì?"
-                content="Quy đổi từ điểm phân loại của mô hình Random Forest (300 cây quyết định) trên cửa sổ 30 giây kết hợp bộ lọc bối cảnh gia tốc ACC. 0–39: Thư giãn · 40–59: Chú ý · 60–100: Căng thẳng."
+                content="Quy đổi từ xác suất phân loại của mô hình Random Forest (300 cây quyết định) trên cửa sổ 30 giây, đồng nhất với ngưỡng nhị phân 0.50 trong PostgreSQL. 0–34: Thư giãn · 35–49: Chú ý · 50–100: Căng thẳng."
               />
             </div>
             <StressGauge
@@ -1004,7 +1019,7 @@ export function PersonalTab({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => handleFeedback("ACCURATE")}
+                  onClick={() => void handleFeedback("ACCURATE")}
                   className="rounded-xl px-3 py-2.5 text-xs font-bold cursor-pointer transition-colors"
                   style={{
                     backgroundColor: "var(--surface-2)",
@@ -1016,7 +1031,7 @@ export function PersonalTab({
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleFeedback("FALSE_ALARM")}
+                  onClick={() => void handleFeedback("FALSE_ALARM")}
                   className="rounded-xl px-3 py-2.5 text-xs font-bold cursor-pointer transition-colors"
                   style={{
                     backgroundColor: "var(--surface-2)",
@@ -1030,9 +1045,14 @@ export function PersonalTab({
               {feedbackBanner && (
                 <div
                   className="rounded-lg px-3 py-2 text-xs font-semibold"
-                  style={{ backgroundColor: "var(--emerald-soft)", color: "var(--emerald)" }}
+                  style={{
+                    backgroundColor: feedbackBanner.isError
+                      ? "var(--crimson-soft)"
+                      : "var(--emerald-soft)",
+                    color: feedbackBanner.isError ? "var(--crimson)" : "var(--emerald)",
+                  }}
                 >
-                  {feedbackBanner}
+                  {feedbackBanner.text}
                 </div>
               )}
             </div>
@@ -1057,7 +1077,7 @@ export function PersonalTab({
                   {data.sessionSummary.alertCount}
                 </div>
                 <div className="text-[11px]" style={{ color: "var(--muted)" }}>
-                  Số cảnh báo sớm
+                  Cảnh báo Dashboard (≥60s)
                 </div>
               </div>
               <div className="surface-subtle p-2.5">

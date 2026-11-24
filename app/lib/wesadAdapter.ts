@@ -75,6 +75,7 @@ interface RawDeviceSession {
   subject_id: string;
   scenario_id?: string | null;
   speed: number;
+  paused?: boolean;
   producer_status: string;
   edge_status: string;
   producer_logs?: string[];
@@ -238,7 +239,11 @@ export async function fetchDashboardBundle(params: {
 
     const subjSession = devices.find((d) => d.subject_id === params.subjectId);
     let streamState: PersonalDashboardData["streamState"] = "stopped";
-    if (params.pausedLocally) {
+    if (
+      params.pausedLocally ||
+      subjSession?.paused ||
+      subjSession?.producer_status === "paused"
+    ) {
       streamState = "paused";
     } else if (
       subjSession &&
@@ -298,20 +303,22 @@ export async function fetchDashboardBundle(params: {
       const accG =
         v.acc_activity_g !== undefined && v.acc_activity_g !== null ? Number(v.acc_activity_g) : null;
 
-      // Motion shield triggers when vigorous physical motion occurs without sympathetic EDA surge
+      // Motion shield highlights physical activity context ONLY when RF itself classified NON_STRESS
+      const isDbStress = row.prediction === "STRESS";
       const motionShield =
-        (activity === "HIGH_ACTIVITY" && (eda === null || eda < 2.1)) ||
-        (params.scenarioId === "physical_activity_check" &&
-          activity !== "RESTING" &&
-          (hrDelta ?? 0) >= 12 &&
-          (eda === null || eda < 1.9));
+        !isDbStress &&
+        ((activity === "HIGH_ACTIVITY" && (eda === null || eda < 2.5)) ||
+          (params.scenarioId === "physical_activity_check" &&
+            activity !== "RESTING" &&
+            (hrDelta ?? 0) >= 10 &&
+            (eda === null || eda < 2.2)));
 
       const rawIndex =
         v.stress_load !== undefined && v.stress_load !== null
           ? Number(v.stress_load)
           : Math.round(rawRf * 100);
-      const displayScore = motionShield ? Math.min(35, rawIndex) : rawIndex;
-      const zone: ZoneState = motionShield ? "RELAXED" : scoreToZone(displayScore);
+      const displayScore = rawIndex;
+      const zone: ZoneState = scoreToZone(displayScore, row.prediction);
       const fb = row.feedback ?? params.localFeedbackMap[row.window_start] ?? null;
 
       if (zone === "STRESS") {
@@ -332,7 +339,7 @@ export async function fetchDashboardBundle(params: {
             timestampMs: startMs + 10_000,
             clockLabel: fmtClockShort(row.window_start),
             type: "ALERT_SENT",
-            label: "Đã gửi cảnh báo",
+            label: "Cảnh báo trên Dashboard (≥60s)",
           });
         }
       } else {
@@ -677,14 +684,41 @@ export async function stopStreamOnApi(subjectId: string, forceMockMode: boolean)
   }
 }
 
+export async function pauseStreamOnApi(params: {
+  subjectId: string;
+  paused: boolean;
+  forceMockMode: boolean;
+}): Promise<{ ok: boolean; error?: string }> {
+  if (params.forceMockMode) return { ok: true };
+  try {
+    await fetchJsonWithTimeout(
+      `${DEVICE_API}/devices/${encodeURIComponent(params.subjectId)}/pause`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paused: params.paused }),
+      }
+    );
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Không gửi được lệnh tạm dừng/tiếp tục tới Device Manager API",
+    };
+  }
+}
+
 export async function submitUserFeedback(params: {
   subjectId: string;
   windowStart: string;
   verdict: "ACCURATE" | "FALSE_ALARM";
   note: string;
   forceMockMode: boolean;
-}): Promise<boolean> {
-  if (params.forceMockMode) return true;
+}): Promise<{ ok: boolean; error?: string }> {
+  if (params.forceMockMode) return { ok: true };
   try {
     await fetchJsonWithTimeout(`${DEVICE_API}/feedback`, {
       method: "POST",
@@ -696,23 +730,35 @@ export async function submitUserFeedback(params: {
         note: params.note,
       }),
     });
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Không lưu được phản hồi người đeo vào PostgreSQL",
+    };
   }
 }
 
 export async function activateModelVersion(
   version: string,
   forceMockMode: boolean
-): Promise<boolean> {
-  if (forceMockMode) return true;
+): Promise<{ ok: boolean; error?: string }> {
+  if (forceMockMode) return { ok: true };
   try {
     await fetchJsonWithTimeout(`${REGISTRY_API}/models/${encodeURIComponent(version)}/activate`, {
       method: "PUT",
     });
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : `Không kích hoạt được model ${version} trên Model Registry API (:8000)`,
+    };
   }
 }

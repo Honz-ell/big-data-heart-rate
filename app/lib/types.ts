@@ -136,11 +136,18 @@ export interface TeamMemberSummary {
   windowsCount?: number;
 }
 
+export interface HeatmapCell {
+  hour: string;
+  score: number | null;
+  zone: ZoneState | "UNMEASURED";
+  clockUtc?: string;
+}
+
 export interface HeatmapRow {
   anonymousCode: string;
   subjectId: string;
   role: string;
-  hourlyScores: { hour: string; score: number; zone: ZoneState }[];
+  hourlyScores: HeatmapCell[];
 }
 
 export interface CohortJobState {
@@ -155,10 +162,19 @@ export interface CohortJobState {
 export interface TeamOverviewData {
   stressedRatioPercent: number;
   alertsToday: number;
-  avgRecoveryMinutes: number;
+  avgRecoveryMinutes: number | null;
   realMeasuredCount?: number;
   realStressedCount?: number;
   realStressWindowsTotal?: number;
+  realSustainedAlerts?: number;
+  realAvgRecoveryMinutes?: number | null;
+  realHeatmap?: HeatmapRow[];
+  realPeakHours?: {
+    hourRange: string;
+    avgScore: number;
+    affectedPercent: number;
+    contextNote: string;
+  }[];
   cohortJob?: CohortJobState;
   members: TeamMemberSummary[];
   heatmap: HeatmapRow[];
@@ -200,6 +216,7 @@ export interface LosoSubjectScore {
 }
 
 export interface SystemTelemetryData {
+  metricsAvailable?: boolean;
   services: {
     kafka: ServiceHealth;
     spark: ServiceHealth;

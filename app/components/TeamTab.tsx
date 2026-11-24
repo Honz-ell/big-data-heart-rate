@@ -85,7 +85,7 @@ export function TeamTab({
             <div>
               <strong style={{ color: "var(--ink)" }}>Chính sách Quyền riêng tư &amp; Chạy Toàn Nhóm (S2–S17):</strong>{" "}
               <span style={{ color: "var(--muted)" }}>
-                Khi đang ở Tab 2, chọn bất kỳ kịch bản nào phía trên sẽ <strong>chạy cuốn chiếu lần lượt cả 15 file <code>.pkl</code> thật</strong> (chỉ tốn ~1 GB RAM) và cập nhật thẳng vào PostgreSQL!
+                Khi đang ở Tab 2, chọn kịch bản phía trên sẽ <strong>chạy cuốn chiếu trực tiếp trên các tệp <code>.pkl</code> thật hiện có</strong> (~1 GB RAM) và lưu vào PostgreSQL (từ chối ghi dữ liệu mô phỏng vào DB).
               </span>
             </div>
           </div>
@@ -161,6 +161,14 @@ export function TeamTab({
             </div>
           </div>
         )}
+        {data.cohortJob?.status === "failed" && data.cohortJob.error && (
+          <div
+            className="rounded-xl px-3.5 py-2 text-xs font-bold"
+            style={{ backgroundColor: "var(--crimson-soft)", color: "var(--crimson)" }}
+          >
+            ⚠ {data.cohortJob.error}
+          </div>
+        )}
       </div>
 
       {/* 3 Group KPI Cards */}
@@ -172,7 +180,7 @@ export function TeamTab({
             </span>
             <InfoTooltip
               title="% người đang căng thẳng"
-              content="Tỷ lệ thành viên có chỉ số căng thẳng ≥ 60/100 ở cửa sổ 30 giây gần nhất trong PostgreSQL (đã loại trừ người đang vận động thể chất)."
+              content="Tỷ lệ thành viên có kết quả phân loại STRESS (điểm Random Forest ≥ 50/100) ở cửa sổ 30 giây mới nhất trong PostgreSQL."
             />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
@@ -189,30 +197,32 @@ export function TeamTab({
             </span>
           </div>
           <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-            Ngưỡng khuyến nghị điều phối ca: dưới 25% toàn nhóm
+            Đồng nhất ngưỡng phân loại <code>prediction = &apos;STRESS&apos;</code> (≥ 0.50) từ DB
           </p>
         </div>
 
         <div className="surface-card p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-              Số cảnh báo ghi nhận trong DB
+              {strictRealOnly ? "Đợt Stress liên tiếp (≥60s) trong DB" : "Đợt cảnh báo trên Dashboard"}
             </span>
             <InfoTooltip
-              title="Tổng số cảnh báo"
-              content="Tính trực tiếp từ tổng số cửa sổ dự đoán STRESS đã lưu trong bảng stress_predictions của PostgreSQL."
+              title="Cách tính đợt Stress liên tiếp"
+              content="Đếm trực tiếp từ chuỗi thời gian bảng stress_predictions: mỗi đợt gồm ≥ 2 cửa sổ 30 giây liên tiếp cùng phân loại STRESS (không ước lượng chia đôi, không gửi thông báo SMS/Email ra ngoài)."
             />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-4xl font-black tabular-nums" style={{ color: "var(--amber)" }}>
-              {strictRealOnly ? Math.max(0, Math.ceil((data.realStressWindowsTotal ?? 0) / 2)) : data.alertsToday}
+              {strictRealOnly ? (data.realSustainedAlerts ?? 0) : data.alertsToday}
             </span>
             <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
-              đợt cảnh báo ({data.realStressWindowsTotal ?? 0} cửa sổ Stress trong DB)
+              {strictRealOnly
+                ? `đợt ≥60s (${data.realStressWindowsTotal ?? 0} cửa sổ STRESS trong DB)`
+                : "đợt cảnh báo hiển thị (minh họa)"}
             </span>
           </div>
           <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-            Đã tự động lọc bỏ các lượt tăng nhịp tim do đi lại
+            Cảnh báo trực quan trên Dashboard khi ≥ 2 cửa sổ 30s liên tiếp vượt ngưỡng
           </p>
         </div>
 
@@ -222,21 +232,52 @@ export function TeamTab({
               Thời gian phục hồi trung bình
             </span>
             <InfoTooltip
-              title="Thời gian phục hồi (phút)"
-              content="Khoảng thời gian trung bình để chỉ số căng thẳng hạ từ vùng Đỏ (≥ 60) trở lại vùng Xanh (< 40) sau khi nghỉ ngơi hoặc tập thở 4-4-6."
+              title="Thời gian phục hồi thực đo"
+              content="Ở chế độ DB thật, tính trung bình khoảng cách thời gian từ cuối một đợt STRESS sang cửa sổ NON_STRESS kế tiếp trong cùng phiên đo của từng người."
             />
           </div>
-          <div className="mt-2 flex items-baseline gap-2">
-            <span className="text-4xl font-black tabular-nums" style={{ color: "var(--sky)" }}>
-              {data.avgRecoveryMinutes.toFixed(1)}
-            </span>
-            <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
-              phút / đợt
-            </span>
-          </div>
-          <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
-            Nhanh hơn 38% khi thực hiện bài thở điều hòa 4-4-6
-          </p>
+          {strictRealOnly ? (
+            data.realAvgRecoveryMinutes !== null && data.realAvgRecoveryMinutes !== undefined ? (
+              <>
+                <div className="mt-2 flex items-baseline gap-2">
+                  <span className="text-4xl font-black tabular-nums" style={{ color: "var(--sky)" }}>
+                    {data.realAvgRecoveryMinutes.toFixed(1)}
+                  </span>
+                  <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
+                    phút / đợt chuyển tiếp (từ DB thật)
+                  </span>
+                </div>
+                <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
+                  Tính trực tiếp từ các điểm chuyển <code>STRESS → NON_STRESS</code> trong PostgreSQL
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="mt-2 flex items-baseline gap-2">
+                  <span className="text-3xl font-black tabular-nums" style={{ color: "var(--muted)" }}>
+                    Chưa có chuỗi
+                  </span>
+                </div>
+                <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
+                  Chạy <strong>Kịch bản 3 (Căng thẳng → Phục hồi)</strong> để đo thời gian hồi phục thật trong DB
+                </p>
+              </>
+            )
+          ) : (
+            <>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-4xl font-black tabular-nums" style={{ color: "var(--sky)" }}>
+                  {(data.avgRecoveryMinutes ?? 3.5).toFixed(1)}
+                </span>
+                <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
+                  phút / đợt (mô phỏng minh họa)
+                </span>
+              </div>
+              <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
+                Giá trị tham khảo ở chế độ mô phỏng ca trực
+              </p>
+            </>
+          )}
         </div>
       </section>
 
@@ -382,78 +423,108 @@ export function TeamTab({
         </div>
       </section>
 
-      {/* HEATMAP GIỜ TRONG NGÀY × NGƯỜI + TOP 3 KHUNG GIỜ ÁP LỰC CAO */}
+      {/* HEATMAP (100% REAL POSTGRESQL WINDOWS IN LIVE MODE, OR LABELED SHIFT SIMULATION) */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
         <section className="surface-card xl:col-span-8 p-5 lg:p-6 space-y-4 overflow-x-auto">
           <div className="flex items-center justify-between gap-2">
             <div>
               <h3 className="text-base sm:text-lg font-extrabold" style={{ color: "var(--ink)" }}>
-                Bản đồ nhiệt (Heatmap): Khung giờ trong ngày × Thành viên
+                {strictRealOnly
+                  ? "Bản đồ nhiệt (Heatmap): Chuỗi cửa sổ 30s thực tế trong PostgreSQL × Thành viên"
+                  : "Bản đồ nhiệt Minh họa Ca trực (Kèm mô phỏng): Khung giờ × Thành viên"}
               </h3>
               <p className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
-                Giúp quản lý phát hiện ca trực hoặc khung giờ có áp lực tập trung cao để bố trí giải lao hợp lý
+                {strictRealOnly
+                  ? "100% con số truy vấn trực tiếp từ bảng stress_predictions (ô '—' nghĩa là thành viên chưa có cửa sổ tại bước đó)"
+                  : "Chế độ minh họa ghép dữ liệu DB với khung giờ hành chính 08:00–17:00"}
               </p>
             </div>
             <InfoTooltip
               title="Cách đọc bản đồ nhiệt"
-              content="Mỗi ô thể hiện chỉ số căng thẳng trung bình (0–100) của một thành viên ẩn danh trong khung giờ đó. Có hiển thị kèm con số để người mù màu vẫn đọc chính xác."
+              content={
+                strictRealOnly
+                  ? "Mỗi cột thể hiện một cửa sổ 30 giây thật trong phiên gần nhất của từng người trong PostgreSQL (từ các cửa sổ trước đến cửa sổ 'Mới nhất'). Ngưỡng Đỏ ≥ 50 khớp chính xác cột prediction = 'STRESS'."
+                  : "Mỗi ô thể hiện chỉ số căng thẳng (0–100) minh họa theo khung giờ trong ngày."
+              }
             />
           </div>
 
-          <table className="w-full border-collapse text-xs min-w-[560px]">
-            <thead>
-              <tr>
-                <th className="py-2 pr-3 text-left font-bold" style={{ color: "var(--muted)" }}>
-                  Mã ẩn danh
-                </th>
-                {data.heatmap[0]?.hourlyScores.map((h) => (
-                  <th key={h.hour} className="p-1.5 text-center font-bold tabular-nums" style={{ color: "var(--muted)" }}>
-                    {h.hour}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {data.heatmap.map((row) => (
-                <tr key={row.anonymousCode} className="border-t" style={{ borderColor: "var(--border)" }}>
-                  <td className="py-2 pr-3 font-bold whitespace-nowrap" style={{ color: "var(--ink)" }}>
-                    {row.anonymousCode}
-                    <span className="ml-1.5 font-normal text-[11px] hidden sm:inline" style={{ color: "var(--muted)" }}>
-                      ({row.subjectId})
-                    </span>
-                  </td>
-                  {row.hourlyScores.map((cell) => {
-                    const bg =
-                      cell.zone === "STRESS"
-                        ? "var(--crimson-soft)"
-                        : cell.zone === "ATTENTION"
-                          ? "var(--amber-soft)"
-                          : "var(--emerald-soft)";
-                    const fg =
-                      cell.zone === "STRESS"
-                        ? "var(--crimson)"
-                        : cell.zone === "ATTENTION"
-                          ? "var(--amber)"
-                          : "var(--emerald)";
-                    return (
-                      <td key={cell.hour} className="p-1 text-center">
-                        <div
-                          title={`${row.anonymousCode} lúc ${cell.hour}: ${cell.score}/100`}
-                          className="rounded-lg py-1.5 font-extrabold tabular-nums"
-                          style={{
-                            backgroundColor: bg,
-                            color: fg,
-                          }}
-                        >
-                          {cell.score}
-                        </div>
+          {(() => {
+            const activeHeatmap =
+              strictRealOnly && data.realHeatmap ? data.realHeatmap : data.heatmap;
+            return (
+              <table className="w-full border-collapse text-xs min-w-[560px]">
+                <thead>
+                  <tr>
+                    <th className="py-2 pr-3 text-left font-bold" style={{ color: "var(--muted)" }}>
+                      Mã ẩn danh
+                    </th>
+                    {activeHeatmap[0]?.hourlyScores.map((h) => (
+                      <th key={h.hour} className="p-1.5 text-center font-bold tabular-nums" style={{ color: "var(--muted)" }}>
+                        {h.hour}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeHeatmap.map((row) => (
+                    <tr key={row.anonymousCode} className="border-t" style={{ borderColor: "var(--border)" }}>
+                      <td className="py-2 pr-3 font-bold whitespace-nowrap" style={{ color: "var(--ink)" }}>
+                        {row.anonymousCode}
+                        <span className="ml-1.5 font-normal text-[11px] hidden sm:inline" style={{ color: "var(--muted)" }}>
+                          ({row.subjectId})
+                        </span>
                       </td>
-                    );
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                      {row.hourlyScores.map((cell) => {
+                        if (cell.score === null || cell.zone === "UNMEASURED") {
+                          return (
+                            <td key={cell.hour} className="p-1 text-center">
+                              <div
+                                title={`${row.anonymousCode} (${cell.hour}): chưa có bản ghi trong PostgreSQL`}
+                                className="rounded-lg py-1.5 font-semibold tabular-nums"
+                                style={{
+                                  backgroundColor: "var(--surface-2)",
+                                  color: "var(--muted)",
+                                }}
+                              >
+                                —
+                              </div>
+                            </td>
+                          );
+                        }
+                        const bg =
+                          cell.zone === "STRESS"
+                            ? "var(--crimson-soft)"
+                            : cell.zone === "ATTENTION"
+                              ? "var(--amber-soft)"
+                              : "var(--emerald-soft)";
+                        const fg =
+                          cell.zone === "STRESS"
+                            ? "var(--crimson)"
+                            : cell.zone === "ATTENTION"
+                              ? "var(--amber)"
+                              : "var(--emerald)";
+                        return (
+                          <td key={cell.hour} className="p-1 text-center">
+                            <div
+                              title={`${row.anonymousCode} (${cell.clockUtc ? `${cell.clockUtc} UTC` : cell.hour}): ${cell.score}/100`}
+                              className="rounded-lg py-1.5 font-extrabold tabular-nums"
+                              style={{
+                                backgroundColor: bg,
+                                color: fg,
+                              }}
+                            >
+                              {cell.score}
+                            </div>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            );
+          })()}
         </section>
 
         {/* Top 3 khung giờ áp lực cao nhất */}
@@ -461,15 +532,22 @@ export function TeamTab({
           <div className="space-y-3.5">
             <div>
               <h3 className="text-base sm:text-lg font-extrabold" style={{ color: "var(--ink)" }}>
-                Top 3 Khung giờ Áp lực Cao nhất
+                {strictRealOnly
+                  ? "Thống kê Khung giờ Ghi hình Thật (PostgreSQL)"
+                  : "Top 3 Khung giờ Minh họa Ca trực"}
               </h3>
               <p className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
-                Gợi ý điều chỉnh lịch họp &amp; luân phiên ca trực
+                {strictRealOnly
+                  ? "Tổng hợp trực tiếp theo giờ UTC của các cửa sổ WESAD đã lưu trong DB"
+                  : "Dữ liệu minh họa phân bổ ca trực"}
               </p>
             </div>
 
             <div className="space-y-3">
-              {data.topPeakHours.map((pk, idx) => (
+              {(strictRealOnly && data.realPeakHours && data.realPeakHours.length > 0
+                ? data.realPeakHours
+                : data.topPeakHours
+              ).map((pk, idx) => (
                 <div key={pk.hourRange} className="surface-subtle p-3.5 space-y-1.5">
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-extrabold tabular-nums" style={{ color: "var(--ink)" }}>
@@ -497,7 +575,10 @@ export function TeamTab({
             className="rounded-xl p-3.5 text-xs leading-relaxed"
             style={{ backgroundColor: "var(--emerald-soft)", color: "var(--ink-2)" }}
           >
-            <strong style={{ color: "var(--emerald)" }}>💡 Giá trị thực tiễn cho tổ chức:</strong> Bố trí 5 phút nghỉ giữa ca lúc 10:30 và 15:15 giúp giảm tần suất cảnh báo căng thẳng kéo dài cho tài xế, điều dưỡng trực cấp cứu và nhân viên tổng đài.
+            <strong style={{ color: "var(--emerald)" }}>💡 Ghi chú dữ liệu:</strong>{" "}
+            {strictRealOnly
+              ? "Tất cả số liệu trên đang đọc trực tiếp từ PostgreSQL (không pha trộn dữ liệu ngẫu nhiên). Bạn có thể bật '👁 Kèm mô phỏng' nếu muốn xem giao diện mẫu ca trực 08:00–17:00."
+              : "Đang bật chế độ kèm mô phỏng ca trực 08:00–17:00. Nhấn '● DB thật' để chỉ hiển thị số liệu gốc từ PostgreSQL."}
           </div>
         </section>
       </div>

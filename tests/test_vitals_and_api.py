@@ -281,3 +281,81 @@ def test_resolve_subject_scenario_offsets_for_counterbalanced_subject(tmp_path) 
     assert len(s_rows) >= 48
 
 
+def test_audit_integrity_kpis_pause_and_strict_live_guard(monkeypatch, tmp_path) -> None:
+    import time
+    from datetime import datetime, timedelta, timezone
+    from fastapi.testclient import TestClient
+    import scripts.device_manager_api as dev_api
+
+    # 1. Verify _compute_real_cohort_kpis exact bout & recovery calculation
+    t0 = datetime(2017, 7, 10, 10, 0, 0, tzinfo=timezone.utc)
+    sample_rows = [
+        # Bout 1: 2 consecutive STRESS windows (0..60s) -> 1 sustained alert
+        {
+            "subject_id": "S4",
+            "window_start": t0,
+            "window_end": t0 + timedelta(seconds=30),
+            "prediction": "STRESS",
+            "model_score_stress": 0.72,
+        },
+        {
+            "subject_id": "S4",
+            "window_start": t0 + timedelta(seconds=30),
+            "window_end": t0 + timedelta(seconds=60),
+            "prediction": "STRESS",
+            "model_score_stress": 0.81,
+        },
+        # Recovery window at 60..90s -> 30s (0.5 min) recovery
+        {
+            "subject_id": "S4",
+            "window_start": t0 + timedelta(seconds=60),
+            "window_end": t0 + timedelta(seconds=90),
+            "prediction": "NON_STRESS",
+            "model_score_stress": 0.18,
+        },
+        # Isolated single STRESS window on S5 (not >=60s sustained)
+        {
+            "subject_id": "S5",
+            "window_start": t0,
+            "window_end": t0 + timedelta(seconds=30),
+            "prediction": "STRESS",
+            "model_score_stress": 0.54,
+        },
+    ]
+    kpis = dev_api._compute_real_cohort_kpis(sample_rows)
+    assert kpis["stress_bout_count"] == 2
+    assert kpis["sustained_alert_count"] == 1
+    assert kpis["avg_recovery_minutes"] == 0.5
+    assert kpis["real_peak_hours"][0]["hour_range"] == "10:00 – 10:59 UTC"
+
+    # 2. Verify pause/resume endpoint in demo mode
+    monkeypatch.setattr(dev_api, "DEMO_MODE", True)
+    with TestClient(dev_api.app) as client:
+        start_r = client.post(
+            "/devices/start",
+            json={"subject_id": "S4", "scenario_id": "tsst_acute_stress", "speed": 10},
+        )
+        assert start_r.status_code == 200
+        p1 = client.post("/devices/S4/pause", json={"paused": True})
+        assert p1.status_code == 200
+        assert p1.json()["paused"] is True
+        p2 = client.post("/devices/S4/pause", json={"paused": False})
+        assert p2.status_code == 200
+        assert p2.json()["paused"] is False
+        client.post("/devices/S4/stop")
+
+    # 3. Verify strict live mode refuses to synthesize data when .pkl files are missing
+    empty_root = tmp_path / "empty_wesad"
+    empty_root.mkdir()
+    monkeypatch.setattr(dev_api, "DEMO_MODE", False)
+    monkeypatch.setattr(dev_api, "DATA_ROOT", empty_root)
+    res = dev_api.run_team_scenario(dev_api.CohortScenarioRequest(scenario_id="tsst_acute_stress"))
+    assert res["status"] in {"running", "failed"}
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and dev_api._cohort_state["status"] == "running":
+        time.sleep(0.05)
+    assert dev_api._cohort_state["status"] == "failed"
+    assert "từ chối ghi dữ liệu mô phỏng" in (dev_api._cohort_state["error"] or "")
+
+
+

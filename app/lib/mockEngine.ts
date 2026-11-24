@@ -133,9 +133,11 @@ export const DEFAULT_MODELS: ModelVersionInfo[] = [
   },
 ];
 
-export function scoreToZone(score: number): ZoneState {
-  if (score >= 60) return "STRESS";
-  if (score >= 40) return "ATTENTION";
+export function scoreToZone(score: number, dbPrediction?: string): ZoneState {
+  if (dbPrediction === "STRESS") return "STRESS";
+  if (dbPrediction === "NON_STRESS") return score >= 35 ? "ATTENTION" : "RELAXED";
+  if (score >= 50) return "STRESS";
+  if (score >= 35) return "ATTENTION";
   return "RELAXED";
 }
 
@@ -450,7 +452,7 @@ export function generateMockPersonalState(options: {
           timestampMs: wStartMs + 10_000,
           clockLabel: fmtClockShort(new Date(wStartMs + 10_000).toISOString()),
           type: "ALERT_SENT",
-          label: "Đã gửi cảnh báo sớm",
+          label: "Cảnh báo trên Dashboard (≥60s)",
         });
       }
     } else {
@@ -578,6 +580,13 @@ export function generateMockPersonalState(options: {
   };
 }
 
+export interface RawTeamWindowCell {
+  clock_utc: string;
+  stress_index: number;
+  prediction: string;
+  activity_state: string;
+}
+
 export interface RawTeamSubjectSummary {
   subject_id: string;
   is_streaming: boolean;
@@ -588,6 +597,7 @@ export interface RawTeamSubjectSummary {
   eda_us: number | null;
   activity_state: string;
   sparkline: number[];
+  window_cells?: RawTeamWindowCell[];
   windows_count: number;
 }
 
@@ -595,6 +605,15 @@ export interface RawTeamSummaryPayload {
   mode?: string;
   measured_subjects_count?: number;
   total_stress_windows?: number;
+  sustained_alert_count?: number;
+  stress_bout_count?: number;
+  avg_recovery_minutes?: number | null;
+  real_peak_hours?: {
+    hour_range: string;
+    avg_score: number;
+    affected_percent: number;
+    context_note: string;
+  }[];
   cohort_job?: {
     status?: "idle" | "running" | "completed" | "failed";
     scenario_id?: string | null;
@@ -644,10 +663,13 @@ export function buildTeamOverviewData(
 
     // 2. Any other subject (S2..S17) that has real predictions stored in PostgreSQL!
     if (dbEntry) {
+      const isDbStress = dbEntry.prediction === "STRESS";
       const motion =
-        dbEntry.activity_state === "HIGH_ACTIVITY" && (dbEntry.eda_us === null || dbEntry.eda_us < 2.1);
-      const effScore = motion ? Math.min(35, dbEntry.stress_index) : dbEntry.stress_index;
-      const zone: ZoneState = motion ? "RELAXED" : scoreToZone(effScore);
+        !isDbStress &&
+        dbEntry.activity_state === "HIGH_ACTIVITY" &&
+        (dbEntry.eda_us === null || dbEntry.eda_us < 2.5);
+      const effScore = dbEntry.stress_index;
+      const zone: ZoneState = scoreToZone(effScore, dbEntry.prediction);
       const spk =
         dbEntry.sparkline && dbEntry.sparkline.length >= 2
           ? dbEntry.sparkline
@@ -751,15 +773,70 @@ export function buildTeamOverviewData(
     };
   });
 
+  // 100% Real PostgreSQL Window Heatmap (zero synthetic numbers!)
+  const maxRealCols = Math.min(
+    8,
+    Math.max(
+      4,
+      ...Object.values(realMap).map((e) => e.window_cells?.length ?? e.sparkline?.length ?? 0)
+    )
+  );
+  const realHeatmap: HeatmapRow[] = WESAD_SUBJECTS.map((subj) => {
+    const dbEntry = realMap[subj.id];
+    const cells = dbEntry?.window_cells ?? [];
+    const padded = Array.from({ length: maxRealCols }, (_, cIdx) => {
+      const colLabel =
+        cIdx === maxRealCols - 1 ? "Mới nhất" : `W-${maxRealCols - 1 - cIdx}`;
+      // Align right so column "Mới nhất" is always each subject's latest DB window
+      const offsetFromRight = maxRealCols - 1 - cIdx;
+      const cellIdx = cells.length - 1 - offsetFromRight;
+      const c = cellIdx >= 0 ? cells[cellIdx] : undefined;
+      if (!c) {
+        return {
+          hour: colLabel,
+          score: null,
+          zone: "UNMEASURED" as const,
+        };
+      }
+      return {
+        hour: colLabel,
+        score: c.stress_index,
+        zone: scoreToZone(c.stress_index, c.prediction),
+        clockUtc: c.clock_utc,
+      };
+    });
+    return {
+      anonymousCode: subj.anonCode,
+      subjectId: subj.id,
+      role: subj.role,
+      hourlyScores: padded,
+    };
+  });
+
+  const realPeakHours = (realTeam?.real_peak_hours ?? []).map((item) => ({
+    hourRange: item.hour_range,
+    avgScore: item.avg_score,
+    affectedPercent: item.affected_percent,
+    contextNote: item.context_note,
+  }));
+
   return {
     stressedRatioPercent: Math.round((stressedCount / members.length) * 100),
-    alertsToday: realTeam?.total_stress_windows
-      ? Math.max(1, Math.floor(realTeam.total_stress_windows / 2))
-      : 14 + stressedCount,
-    avgRecoveryMinutes: 3.5,
+    alertsToday:
+      realTeam?.sustained_alert_count !== undefined
+        ? realTeam.sustained_alert_count
+        : 14 + stressedCount,
+    avgRecoveryMinutes:
+      realTeam !== undefined && realTeam !== null
+        ? (realTeam.avg_recovery_minutes ?? null)
+        : 3.5,
     realMeasuredCount: realMembers.length,
     realStressedCount,
     realStressWindowsTotal: realTeam?.total_stress_windows ?? 0,
+    realSustainedAlerts: realTeam?.sustained_alert_count ?? 0,
+    realAvgRecoveryMinutes: realTeam?.avg_recovery_minutes ?? null,
+    realHeatmap,
+    realPeakHours,
     cohortJob: realTeam?.cohort_job
       ? {
           status: realTeam.cohort_job.status ?? "idle",
@@ -802,6 +879,7 @@ export function buildSystemTelemetry(options: {
   scenarioId: ScenarioId;
   modelsOverride?: ModelVersionInfo[];
   liveTelemetry?: {
+    metrics_available?: boolean;
     services?: SystemTelemetryData["services"];
     kafka_records_per_sec?: number;
     spark_processed_per_sec?: number;
@@ -813,15 +891,36 @@ export function buildSystemTelemetry(options: {
   tickSeed: number;
 }): SystemTelemetryData {
   const scenario = DEMO_SCENARIOS.find((s) => s.id === options.scenarioId) ?? DEMO_SCENARIOS[0];
+  const hasLiveBackend = Boolean(options.liveTelemetry);
+  const metricsAvailable = hasLiveBackend
+    ? Boolean(options.liveTelemetry?.metrics_available)
+    : true;
   const baseRate = options.isStreaming ? Math.round(106 * options.speed) : 0;
-  const kafkaRate = options.liveTelemetry?.kafka_records_per_sec ?? baseRate;
-  const sparkRate =
-    options.liveTelemetry?.spark_processed_per_sec ?? Math.round(kafkaRate * 0.99);
-  const batchMs =
-    options.liveTelemetry?.spark_batch_ms ?? (options.isStreaming ? 178 : 38);
+  const kafkaRate = hasLiveBackend
+    ? Math.round(options.liveTelemetry?.kafka_records_per_sec ?? 0)
+    : baseRate;
+  const sparkRate = hasLiveBackend
+    ? Math.round(options.liveTelemetry?.spark_processed_per_sec ?? 0)
+    : Math.round(kafkaRate * 0.99);
+  const batchMs = hasLiveBackend
+    ? Math.round(options.liveTelemetry?.spark_batch_ms ?? 0)
+    : options.isStreaming
+      ? 178
+      : 38;
 
   const history: SystemMetricPoint[] = Array.from({ length: 12 }, (_, idx) => {
     const tSec = (11 - idx) * 3;
+    if (hasLiveBackend) {
+      // Honest live metrics: no synthetic 3180 fallback or random jitter
+      return {
+        timeLabel: tSec === 0 ? "Hiện tại" : `-${tSec}s`,
+        kafkaRecordsPerSec: kafkaRate,
+        sparkProcessedPerSec: sparkRate,
+        sparkBatchMs: batchMs,
+        cpuPercent: 0,
+        ramMb: 0,
+      };
+    }
     const activeFactor = options.isStreaming ? 1 : idx > 8 ? 0 : 0.3;
     const jitter = deterministicNoise(options.tickSeed + idx * 7);
     const kRate = Math.max(
@@ -862,6 +961,7 @@ export function buildSystemTelemetry(options: {
   };
 
   return {
+    metricsAvailable,
     services: options.liveTelemetry?.services ?? {
       kafka: options.isStreaming ? "healthy" : "idle",
       spark: "healthy",
@@ -869,15 +969,15 @@ export function buildSystemTelemetry(options: {
       postgres: "healthy",
     },
     liveNodes: {
-      sensorRatePerSec: options.isStreaming ? 106 * options.speed : 0,
+      sensorRatePerSec: hasLiveBackend ? kafkaRate : options.isStreaming ? 106 * options.speed : 0,
       kafkaRecordsPerSec: kafkaRate,
       sparkBatchMs: batchMs,
-      sparkWindowsTotal: options.liveTelemetry?.total_spark_windows ?? 184,
+      sparkWindowsTotal: options.liveTelemetry?.total_spark_windows ?? (hasLiveBackend ? 0 : 184),
       postgresRowsTotal:
-        (options.liveTelemetry?.total_predictions ?? 62) +
-        (options.liveTelemetry?.total_spark_windows ?? 184) * 5,
+        (options.liveTelemetry?.total_predictions ?? (hasLiveBackend ? 0 : 62)) +
+        (options.liveTelemetry?.total_spark_windows ?? (hasLiveBackend ? 0 : 184)) * 5,
       edgeWindowSec: 30,
-      edgePredictionsTotal: options.liveTelemetry?.total_predictions ?? 62,
+      edgePredictionsTotal: options.liveTelemetry?.total_predictions ?? (hasLiveBackend ? 0 : 62),
     },
     history,
     containers: [

@@ -12,6 +12,7 @@ import {
   activateModelVersion,
   AdapterFetchBundle,
   fetchDashboardBundle,
+  pauseStreamOnApi,
   startCohortScenarioOnApi,
   startScenarioOnApi,
   stopStreamOnApi,
@@ -254,12 +255,21 @@ export default function HomePage() {
     void loadBundle(tickSeed + 1, { force: true });
   };
 
-  const handleTogglePause = () => {
-    setPausedLocally((prev) => {
-      const next = !prev;
-      setMockStreamState(next ? "paused" : "running");
-      return next;
+  const handleTogglePause = async () => {
+    setActionError(null);
+    const nextPaused = !pausedLocally;
+    const res = await pauseStreamOnApi({
+      subjectId,
+      paused: nextPaused,
+      forceMockMode,
     });
+    if (!forceMockMode && !res.ok) {
+      setActionError(res.error ?? "Không tạm dừng/tiếp tục được luồng thiết bị.");
+      return;
+    }
+    setPausedLocally(nextPaused);
+    setMockStreamState(nextPaused ? "paused" : "running");
+    void loadBundle(tickSeed + 1, { force: true });
   };
 
   const handleStop = async () => {
@@ -269,9 +279,23 @@ export default function HomePage() {
     void loadBundle(tickSeed + 1);
   };
 
-  const handleFeedback = async (verdict: "ACCURATE" | "FALSE_ALARM") => {
+  const handleFeedback = async (
+    verdict: "ACCURATE" | "FALSE_ALARM"
+  ): Promise<{ ok: boolean; error?: string }> => {
+    setActionError(null);
     const winStart =
       bundle?.personal.edgeWindows.at(-1)?.window_start ?? new Date().toISOString();
+    const res = await submitUserFeedback({
+      subjectId,
+      windowStart: winStart,
+      verdict,
+      note: verdict === "ACCURATE" ? "Người đeo xác nhận đúng" : "Báo nhầm",
+      forceMockMode,
+    });
+    if (!res.ok) {
+      setActionError(res.error ?? "Không lưu được phản hồi người đeo vào PostgreSQL.");
+      return res;
+    }
     setLocalFeedbackMap((prev) => ({
       ...prev,
       [winStart]: {
@@ -279,20 +303,22 @@ export default function HomePage() {
         note: verdict === "ACCURATE" ? "Người đeo xác nhận đúng" : "Báo nhầm do vận động/cà phê",
       },
     }));
-    await submitUserFeedback({
-      subjectId,
-      windowStart: winStart,
-      verdict,
-      note: verdict === "ACCURATE" ? "Người đeo xác nhận đúng" : "Báo nhầm",
-      forceMockMode,
-    });
-    void loadBundle(tickSeed + 1);
+    void loadBundle(tickSeed + 1, { force: true });
+    return { ok: true };
   };
 
-  const handleActivateModel = async (version: string) => {
+  const handleActivateModel = async (
+    version: string
+  ): Promise<{ ok: boolean; error?: string }> => {
+    setActionError(null);
+    const res = await activateModelVersion(version, forceMockMode);
+    if (!res.ok) {
+      setActionError(res.error ?? `Không kích hoạt được model ${version}.`);
+      return res;
+    }
     setMockActiveModel(version);
-    await activateModelVersion(version, forceMockMode);
-    await loadBundle(tickSeed + 1);
+    await loadBundle(tickSeed + 1, { force: true });
+    return { ok: true };
   };
 
   const handleInspectTeamMember = (memberSubjectId: string) => {
@@ -403,7 +429,7 @@ export default function HomePage() {
               <PersonalTab
                 data={bundle.personal}
                 onOpenBreathing={() => setBreathingOpen(true)}
-                onSendFeedback={(v) => void handleFeedback(v)}
+                onSendFeedback={handleFeedback}
                 onStartQuick={() => void handleLaunchScenario("tsst_acute_stress")}
               />
             )}

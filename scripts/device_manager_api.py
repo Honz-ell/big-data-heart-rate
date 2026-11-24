@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import threading
@@ -66,6 +67,32 @@ class FeedbackRequest(BaseModel):
 
 class CohortScenarioRequest(BaseModel):
     scenario_id: str = Field(default="tsst_acute_stress")
+
+
+class PauseDeviceRequest(BaseModel):
+    paused: bool = Field(default=True)
+
+
+def _probe_tcp(host_port: str, timeout: float = 0.35) -> bool:
+    """Return True only if a real TCP socket connection succeeds."""
+    target = host_port.split(",")[0].strip()
+    if ":" in target:
+        host, port_str = target.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            return False
+    else:
+        host, port = target, 9092
+    try:
+        with socket.create_connection((host or "127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _pause_flag_path(subject_id: str) -> Path:
+    return RUNTIME_DIR / f"pause_{subject_id}.flag"
 
 
 sessions: dict[str, dict[str, Any]] = {}
@@ -211,7 +238,11 @@ def read_tail(path: Path | None, lines: int = 16) -> list[str]:
 
 
 def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
+    is_paused = bool(session.get("paused", False))
     if session.get("is_demo"):
+        prod_st = session.get("demo_producer_status", "completed")
+        if is_paused and prod_st == "running":
+            prod_st = "paused"
         return {
             "device_id": f"wearable-{subject_id.lower()}",
             "subject_id": subject_id,
@@ -220,7 +251,8 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
             "duration_seconds": session["duration_seconds"],
             "speed": session["speed"],
             "created_at": session["created_at"],
-            "producer_status": session.get("demo_producer_status", "completed"),
+            "paused": is_paused,
+            "producer_status": prod_st,
             "edge_status": session.get("demo_edge_status", "completed"),
             "consumer_group": session["consumer_group"],
             "mode": "demo_replay",
@@ -233,7 +265,10 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
             return "stopped"
         if session.get("launching") and session.get(name) is None:
             return "starting"
-        return process_state(session.get(name))
+        st = process_state(session.get(name))
+        if name == "producer" and is_paused and st == "running":
+            return "paused"
+        return st
 
     return {
         "device_id": f"wearable-{subject_id.lower()}",
@@ -243,6 +278,7 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds": session["duration_seconds"],
         "speed": session["speed"],
         "created_at": session["created_at"],
+        "paused": is_paused,
         "producer_status": current_state("producer"),
         "edge_status": current_state("edge"),
         "consumer_group": session["consumer_group"],
@@ -413,6 +449,8 @@ def _start_demo_session(request: StartDeviceRequest, scenario_id: str) -> dict[s
         sent_samples = 0
 
         for bucket_idx in range(total_10s_buckets):
+            while session.get("paused") and not session.get("demo_cancelled"):
+                time.sleep(0.15)
             if session.get("demo_cancelled"):
                 session["demo_producer_status"] = "stopped"
                 session["demo_edge_status"] = "stopped"
@@ -486,6 +524,8 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
                 previous["launching"] = False
 
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        pause_flag = _pause_flag_path(subject_id)
+        pause_flag.unlink(missing_ok=True)
         session_id = uuid.uuid4().hex[:8]
         consumer_group = f"edge-{subject_id.lower()}-{session_id}"
         edge_log = RUNTIME_DIR / f"{subject_id}-{session_id}-edge.log"
@@ -515,11 +555,13 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             "--limit", "0",
             "--broker", BROKER,
             "--topic", TOPIC,
+            "--pause-file", str(pause_flag),
         ]
         child_env = os.environ.copy()
         child_env["PYTHONUTF8"] = "1"
         session: dict[str, Any] = {
             "is_demo": False,
+            "paused": False,
             "scenario_id": scenario_id,
             "producer": None,
             "edge": None,
@@ -609,11 +651,13 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
 
 @app.post("/devices/{subject_id}/stop")
 def stop_device(subject_id: str) -> dict[str, Any]:
+    _pause_flag_path(subject_id).unlink(missing_ok=True)
     with sessions_lock:
         session = sessions.get(subject_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"No session for {subject_id}")
         session["cancelled"] = True
+        session["paused"] = False
         session["launching"] = False
         if session.get("is_demo"):
             session["demo_cancelled"] = True
@@ -625,6 +669,34 @@ def stop_device(subject_id: str) -> dict[str, Any]:
         session["producer_stopped"] = True
         session["edge_stopped"] = True
         return public_session(subject_id, session)
+
+
+@app.post("/devices/{subject_id}/pause")
+def pause_device(subject_id: str, request: PauseDeviceRequest) -> dict[str, Any]:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    flag = _pause_flag_path(subject_id)
+    with sessions_lock:
+        session = sessions.get(subject_id)
+        if session is None:
+            flag.unlink(missing_ok=True)
+            return {
+                "subject_id": subject_id,
+                "paused": request.paused,
+                "has_active_stream": False,
+            }
+        session["paused"] = request.paused
+        if not session.get("is_demo"):
+            if request.paused:
+                flag.write_text("paused\n", encoding="utf-8")
+            else:
+                flag.unlink(missing_ok=True)
+        pub = public_session(subject_id, session)
+        return {
+            "subject_id": subject_id,
+            "paused": request.paused,
+            "has_active_stream": pub["producer_status"] in {"running", "paused", "starting"},
+            "session": pub,
+        }
 
 
 def _iso_utc(val: Any) -> str:
@@ -1278,23 +1350,32 @@ def pipeline_telemetry() -> dict[str, Any]:
     recent_spark_ingested = False
     try:
         with db_connect() as connection:
+            connection.execute("SELECT 1").fetchone()
             pg_ok = True
             r1 = connection.execute("SELECT COUNT(*) AS cnt FROM stress_predictions").fetchone()
             r2 = connection.execute(
-                "SELECT COUNT(*) AS cnt, MAX(ingested_at) AS latest FROM sensor_window_aggregates"
+                """
+                SELECT COUNT(*) AS cnt,
+                       MAX(ingested_at) FILTER (WHERE spark_batch_id >= 0) AS latest_spark
+                FROM sensor_window_aggregates
+                """
             ).fetchone()
             total_preds = int((r1 or {}).get("cnt") or 0)
             total_spark = int((r2 or {}).get("cnt") or 0)
-            latest_ing = (r2 or {}).get("latest")
+            latest_ing = (r2 or {}).get("latest_spark")
             if isinstance(latest_ing, datetime):
-                recent_spark_ingested = (datetime.now(timezone.utc) - latest_ing).total_seconds() < 120
+                recent_spark_ingested = (datetime.now(timezone.utc) - latest_ing).total_seconds() < 90
     except psycopg.Error:
         pg_ok = False
 
-    spark_up = recent_spark_ingested or total_spark > 0
-    spark_in_rate = 0.0
-    spark_proc_rate = 0.0
-    spark_batch_ms = 0.0
+    kafka_tcp_ok = _probe_tcp(BROKER, timeout=0.35)
+    spark_ui_ok = _probe_tcp("127.0.0.1:4040", timeout=0.30)
+
+    prom_ok = False
+    spark_prom_up: bool | None = None
+    spark_in_rate: float | None = None
+    spark_proc_rate: float | None = None
+    spark_batch_ms: float | None = None
     try:
         prom_resp = requests.get(
             "http://127.0.0.1:9090/api/v1/query",
@@ -1303,41 +1384,141 @@ def pipeline_telemetry() -> dict[str, Any]:
         )
         if prom_resp.status_code == 200:
             results = prom_resp.json().get("data", {}).get("result", [])
+            if results:
+                prom_ok = True
             for item in results:
                 name = item.get("metric", {}).get("__name__", "")
                 val_pair = item.get("value") or [0, "0"]
                 val = float(val_pair[1])
                 if name == "wesad_spark_stream_up":
-                    spark_up = val >= 1.0
+                    spark_prom_up = val >= 1.0
                 elif name == "wesad_spark_input_records_per_second":
-                    spark_in_rate = val
+                    spark_in_rate = round(val, 1)
                 elif name == "wesad_spark_processed_records_per_second":
-                    spark_proc_rate = val
+                    spark_proc_rate = round(val, 1)
                 elif name == "wesad_spark_trigger_execution_ms":
-                    spark_batch_ms = val
+                    spark_batch_ms = round(val, 1)
     except Exception:
         pass
-    if spark_in_rate <= 0.0 and any_prod_running:
-        active_speed = max((float(s.get("speed") or 1) for s in active_sessions), default=30.0)
-        spark_in_rate = round(106.0 * active_speed, 1)
-        spark_proc_rate = round(104.5 * active_speed, 1)
-        if spark_batch_ms <= 0.0:
-            spark_batch_ms = 195.0
+
+    if spark_prom_up is True or spark_ui_ok:
+        spark_service_state = "healthy"
+    elif recent_spark_ingested:
+        spark_service_state = "healthy"
+    elif spark_prom_up is False:
+        spark_service_state = "down"
+    else:
+        spark_service_state = "idle"
+
+    kafka_service_state = (
+        ("healthy" if any_prod_running else "healthy")
+        if kafka_tcp_ok
+        else "down"
+    )
 
     return {
         "mode": "live_stack",
+        "metrics_available": prom_ok,
         "services": {
-            "kafka": "healthy" if (any_prod_running or pg_ok) else "degraded",
-            "spark": "healthy" if spark_up else "degraded",
+            "kafka": kafka_service_state,
+            "spark": spark_service_state,
             "edge": "healthy" if any_edge_running else "idle",
             "postgres": "healthy" if pg_ok else "down",
         },
-        "kafka_records_per_sec": round(spark_in_rate, 1),
-        "spark_processed_per_sec": round(spark_proc_rate, 1),
-        "spark_batch_ms": round(spark_batch_ms, 1),
+        "kafka_records_per_sec": spark_in_rate if spark_in_rate is not None else 0.0,
+        "spark_processed_per_sec": spark_proc_rate if spark_proc_rate is not None else 0.0,
+        "spark_batch_ms": spark_batch_ms if spark_batch_ms is not None else 0.0,
         "total_predictions": total_preds,
         "total_spark_windows": total_spark // 5,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _compute_real_cohort_kpis(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute real bout counts, recovery time, and UTC hour distribution from stress_predictions."""
+    by_subj: dict[str, list[dict[str, Any]]] = {}
+    hour_buckets: dict[int, list[dict[str, Any]]] = {}
+
+    for r in all_rows:
+        sid = str(r["subject_id"])
+        by_subj.setdefault(sid, []).append(r)
+        ws = r["window_start"]
+        if isinstance(ws, str):
+            ws_dt = datetime.fromisoformat(ws.replace("Z", "+00:00"))
+        else:
+            ws_dt = ws
+        hour_buckets.setdefault(int(ws_dt.astimezone(timezone.utc).hour), []).append(r)
+
+    sustained_alerts = 0
+    stress_bouts = 0
+    recovery_minutes_list: list[float] = []
+
+    for _sid, rows in by_subj.items():
+        streak = 0
+        prev_end_dt: datetime | None = None
+        last_stress_end_dt: datetime | None = None
+        awaiting_recovery = False
+
+        for r in rows:
+            ws = r["window_start"]
+            we = r["window_end"]
+            ws_dt = datetime.fromisoformat(ws.replace("Z", "+00:00")) if isinstance(ws, str) else ws
+            we_dt = datetime.fromisoformat(we.replace("Z", "+00:00")) if isinstance(we, str) else we
+            is_contiguous = prev_end_dt is not None and abs((ws_dt - prev_end_dt).total_seconds()) <= 45.0
+
+            if str(r["prediction"]) == "STRESS":
+                if not is_contiguous or streak == 0:
+                    streak = 1
+                    stress_bouts += 1
+                else:
+                    streak += 1
+                    if streak == 2:
+                        sustained_alerts += 1
+                last_stress_end_dt = we_dt
+                awaiting_recovery = True
+            else:
+                if awaiting_recovery and last_stress_end_dt is not None:
+                    gap_sec = (we_dt - last_stress_end_dt).total_seconds()
+                    if 0 < gap_sec <= 900.0:
+                        recovery_minutes_list.append(gap_sec / 60.0)
+                    awaiting_recovery = False
+                streak = 0
+            prev_end_dt = we_dt
+
+    avg_rec: float | None = (
+        round(sum(recovery_minutes_list) / len(recovery_minutes_list), 1)
+        if recovery_minutes_list
+        else None
+    )
+
+    peak_hours: list[dict[str, Any]] = []
+    for hr_utc, h_rows in hour_buckets.items():
+        scores = [round(float(x.get("model_score_stress") or 0.0) * 100.0) for x in h_rows]
+        avg_sc = int(round(sum(scores) / len(scores))) if scores else 0
+        subjs_total = {str(x["subject_id"]) for x in h_rows}
+        subjs_stressed = {
+            str(x["subject_id"]) for x in h_rows if str(x.get("prediction")) == "STRESS"
+        }
+        aff_pct = int(round((len(subjs_stressed) / max(1, len(subjs_total))) * 100.0))
+        stress_wins = sum(1 for x in h_rows if str(x.get("prediction")) == "STRESS")
+        peak_hours.append(
+            {
+                "hour_range": f"{hr_utc:02d}:00 – {hr_utc:02d}:59 UTC",
+                "avg_score": avg_sc,
+                "affected_percent": aff_pct,
+                "context_note": (
+                    f"Thực đo từ PostgreSQL: {len(h_rows)} cửa sổ 30s trên {len(subjs_total)} người "
+                    f"({stress_wins} cửa sổ phân loại STRESS)."
+                ),
+            }
+        )
+    peak_hours.sort(key=lambda item: (item["avg_score"], item["affected_percent"]), reverse=True)
+
+    return {
+        "sustained_alert_count": sustained_alerts,
+        "stress_bout_count": stress_bouts,
+        "avg_recovery_minutes": avg_rec,
+        "real_peak_hours": peak_hours[:3],
     }
 
 
@@ -1352,10 +1533,12 @@ def team_summary() -> dict[str, Any]:
     if DEMO_MODE:
         subjects_out: dict[str, Any] = {}
         total_stress_win = 0
+        flat_demo_rows: list[dict[str, Any]] = []
         with sessions_lock:
             for sid, rows in demo_predictions.items():
                 if not rows:
                     continue
+                flat_demo_rows.extend(rows)
                 tail = rows[-8:]
                 latest = tail[-1]
                 vit = latest.get("vitals") or {}
@@ -1366,6 +1549,15 @@ def team_summary() -> dict[str, Any]:
                         else round(float(r.get("model_score_stress") or 0) * 100)
                     )
                     for r in tail
+                ]
+                cells = [
+                    {
+                        "clock_utc": _iso_utc(r["window_end"])[11:19],
+                        "stress_index": scores[i],
+                        "prediction": str(r.get("prediction") or "NON_STRESS"),
+                        "activity_state": str((r.get("vitals") or {}).get("activity_state") or "RESTING"),
+                    }
+                    for i, r in enumerate(tail)
                 ]
                 total_stress_win += sum(1 for r in rows if r.get("prediction") == "STRESS")
                 sess_info = active_map.get(sid, {})
@@ -1380,18 +1572,22 @@ def team_summary() -> dict[str, Any]:
                     "eda_us": vit.get("eda_mean_us"),
                     "activity_state": vit.get("activity_state") or "RESTING",
                     "sparkline": scores,
+                    "window_cells": cells,
                     "windows_count": len(rows),
                 }
+        kpis = _compute_real_cohort_kpis(flat_demo_rows)
         return {
             "mode": "demo_replay",
             "measured_subjects_count": len(subjects_out),
             "total_stress_windows": total_stress_win,
+            **kpis,
             "cohort_job": dict(_cohort_state),
             "subjects": subjects_out,
         }
 
     subjects_out = {}
     total_stress_win = 0
+    all_kpi_rows: list[dict[str, Any]] = []
     try:
         with db_connect() as connection:
             ranked_rows = connection.execute(
@@ -1445,13 +1641,20 @@ def team_summary() -> dict[str, Any]:
                 """
             ).fetchall()
 
-            cnt_row = connection.execute(
-                "SELECT COUNT(*) AS cnt FROM stress_predictions WHERE prediction = 'STRESS'"
-            ).fetchone()
-            total_stress_win = int((cnt_row or {}).get("cnt") or 0)
+            all_kpi_rows = connection.execute(
+                """
+                SELECT subject_id, window_start, window_end, prediction, model_score_stress
+                FROM stress_predictions
+                ORDER BY subject_id, window_start ASC
+                """
+            ).fetchall()
+            total_stress_win = sum(
+                1 for r in all_kpi_rows if str(r.get("prediction")) == "STRESS"
+            )
     except psycopg.Error as error:
         raise HTTPException(status_code=503, detail="Could not query team summary") from error
 
+    kpis = _compute_real_cohort_kpis(all_kpi_rows)
     spark_fallback: dict[tuple[str, str], float] = {}
     for srow in spark_latest_rows:
         spark_fallback[(str(srow["subject_id"]), str(srow["sensor"]).upper())] = float(
@@ -1474,6 +1677,19 @@ def team_summary() -> dict[str, Any]:
             )
             for r in tail
         ]
+        cells = [
+            {
+                "clock_utc": _iso_utc(r["window_end"])[11:19],
+                "stress_index": scores[i],
+                "prediction": str(r.get("prediction") or "NON_STRESS"),
+                "activity_state": str(
+                    (r.get("vitals") or {}).get("activity_state")
+                    if isinstance(r.get("vitals"), dict)
+                    else "RESTING"
+                ),
+            }
+            for i, r in enumerate(tail)
+        ]
         hr_val = vit.get("hr_bpm")
         if hr_val is None and (sid, "HR") in spark_fallback:
             hr_val = round(spark_fallback[(sid, "HR")], 1)
@@ -1493,6 +1709,7 @@ def team_summary() -> dict[str, Any]:
             "eda_us": round(float(eda_val), 2) if eda_val is not None else None,
             "activity_state": str(vit.get("activity_state") or "RESTING"),
             "sparkline": scores,
+            "window_cells": cells,
             "windows_count": int(latest.get("total_cnt") or len(tail)),
         }
 
@@ -1500,6 +1717,7 @@ def team_summary() -> dict[str, Any]:
         "mode": "live_stack",
         "measured_subjects_count": len(subjects_out),
         "total_stress_windows": total_stress_win,
+        **kpis,
         "cohort_job": dict(_cohort_state),
         "subjects": subjects_out,
     }
@@ -1508,6 +1726,12 @@ def team_summary() -> dict[str, Any]:
 @app.post("/team/run-scenario")
 def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
     """Sequentially process a scenario across all 15 WESAD subjects (S2..S17) with low memory."""
+    if not DEMO_MODE and not DATA_ROOT.is_dir():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Không tìm thấy thư mục dữ liệu WESAD thật: {DATA_ROOT}",
+        )
+
     scenario_id = _infer_scenario_id(3690, request.scenario_id)
     run_id = uuid.uuid4().hex[:8]
     with sessions_lock:
@@ -1519,6 +1743,7 @@ def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
                 "completed_count": 0,
                 "total_count": len(DEMO_SUBJECTS),
                 "current_subject": DEMO_SUBJECTS[0],
+                "skipped_subjects": [],
                 "error": None,
             }
         )
@@ -1527,6 +1752,8 @@ def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
         try:
             model, model_file, model_version = _load_local_rf()
             cache_dir = RUNTIME_DIR / "cohort_cache"
+            real_written = 0
+            skipped: list[str] = []
 
             for idx, sid in enumerate(DEMO_SUBJECTS):
                 with sessions_lock:
@@ -1534,10 +1761,7 @@ def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
                         return
                     _cohort_state["current_subject"] = sid
 
-                subj_dir = DATA_ROOT / sid
-                has_pkl = (subj_dir / f"{sid}.pkl").is_file()
-
-                if DEMO_MODE or not has_pkl:
+                if DEMO_MODE:
                     s_rows, p_rows = generate_scenario_windows(
                         scenario_id=scenario_id,
                         subject_id=sid,
@@ -1546,29 +1770,47 @@ def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
                         model_version=model_version,
                         duration_seconds=180 if scenario_id == "stress_to_recovery" else 120,
                     )
-                    if DEMO_MODE:
-                        with sessions_lock:
-                            demo_spark_rows[sid] = s_rows
-                            demo_predictions[sid] = p_rows
-                        time.sleep(0.08)
-                else:
-                    t0 = time.monotonic()
-                    catalog = load_or_build_subject_catalog(subj_dir, cache_dir=cache_dir)
-                    if catalog is None:
-                        continue
-                    s_rows, p_rows = build_subject_scenario_records(
-                        catalog=catalog,
-                        scenario_id=scenario_id,
-                        model=model,
-                        model_file=model_file,
-                        model_version=model_version,
-                        spark_batch_base=800 + idx * 20,
-                    )
-                    # If cached in RAM (< 30ms), add tiny 90ms pacing so UI cards ripple smoothly
-                    if time.monotonic() - t0 < 0.05:
-                        time.sleep(0.09)
+                    with sessions_lock:
+                        demo_spark_rows[sid] = s_rows
+                        demo_predictions[sid] = p_rows
+                        if _cohort_state.get("run_id") != run_id:
+                            return
+                        _cohort_state["completed_count"] = idx + 1
+                    time.sleep(0.08)
+                    continue
 
-                if not DEMO_MODE and p_rows:
+                # STRICT LIVE MODE: NEVER write synthetic/mock rows to PostgreSQL!
+                subj_dir = DATA_ROOT / sid
+                has_pkl = (subj_dir / f"{sid}.pkl").is_file()
+                if not has_pkl:
+                    skipped.append(sid)
+                    with sessions_lock:
+                        _cohort_state["skipped_subjects"] = list(skipped)
+                        _cohort_state["completed_count"] = idx + 1
+                    continue
+
+                t0 = time.monotonic()
+                catalog = load_or_build_subject_catalog(subj_dir, cache_dir=cache_dir)
+                if catalog is None:
+                    skipped.append(sid)
+                    with sessions_lock:
+                        _cohort_state["skipped_subjects"] = list(skipped)
+                        _cohort_state["completed_count"] = idx + 1
+                    continue
+
+                s_rows, p_rows = build_subject_scenario_records(
+                    catalog=catalog,
+                    scenario_id=scenario_id,
+                    model=model,
+                    model_file=model_file,
+                    model_version=model_version,
+                    spark_batch_base=-1,
+                )
+                # If cached in RAM (< 30ms), add tiny 90ms pacing so UI cards ripple smoothly
+                if time.monotonic() - t0 < 0.05:
+                    time.sleep(0.09)
+
+                if p_rows:
                     with db_connect() as connection:
                         for pr in p_rows:
                             connection.execute(
@@ -1618,10 +1860,11 @@ def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
                                     sr["mean_value"],
                                     sr["min_value"],
                                     sr["max_value"],
-                                    sr["spark_batch_id"],
+                                    -1,
                                 ),
                             )
                         connection.commit()
+                    real_written += 1
 
                     # Clear stopped single-device replay bounds so clicking this card on Tab 2 shows the new batch on Tab 1
                     with sessions_lock:
@@ -1637,7 +1880,14 @@ def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
 
             with sessions_lock:
                 if _cohort_state.get("run_id") == run_id:
-                    _cohort_state["status"] = "completed"
+                    if not DEMO_MODE and real_written == 0:
+                        _cohort_state["status"] = "failed"
+                        _cohort_state["error"] = (
+                            f"Không tìm thấy tệp .pkl thật nào trong {DATA_ROOT}. "
+                            "Hệ thống từ chối ghi dữ liệu mô phỏng vào PostgreSQL."
+                        )
+                    else:
+                        _cohort_state["status"] = "completed"
                     _cohort_state["current_subject"] = None
         except Exception as err:
             with sessions_lock:
