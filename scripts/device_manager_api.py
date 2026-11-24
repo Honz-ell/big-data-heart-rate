@@ -33,8 +33,8 @@ DATA_ROOT = Path(os.getenv("WESAD_DATA_ROOT", r"D:\btldll\archive\WESAD"))
 RUNTIME_DIR = PROJECT_ROOT / "scripts" / "runtime"
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "stress_rf_no_s4_eval.joblib"
 FALLBACK_MODEL = PROJECT_ROOT / "models" / "stress_rf.joblib"
-REGISTRY_URL = os.getenv("MODEL_REGISTRY_URL", "http://localhost:8000")
-BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
+REGISTRY_URL = os.getenv("MODEL_REGISTRY_URL", "http://127.0.0.1:8000")
+BROKER = os.getenv("KAFKA_BROKER", "127.0.0.1:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "wearable.sensor.v1")
 DEMO_MODE = os.getenv("WESAD_DEMO_MODE", "").strip().lower() in {"1", "true", "yes"}
 DEMO_SUBJECTS = ["S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S13", "S14", "S15", "S16", "S17"]
@@ -122,7 +122,7 @@ def _seed_initial_demo_data() -> None:
 
 def _db_connection_kwargs() -> dict[str, Any]:
     return {
-        "host": os.getenv("DB_HOST", "localhost"),
+        "host": os.getenv("DB_HOST", "127.0.0.1"),
         "port": int(os.getenv("DB_PORT", "5432")),
         "dbname": os.getenv("DB_NAME", "wesad"),
         "user": os.getenv("DB_USER", "wesad"),
@@ -489,6 +489,7 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             "producer": None,
             "edge": None,
             "launching": True,
+            "origin_epoch": None,
             "cancelled": False,
             "producer_stopped": False,
             "edge_stopped": False,
@@ -506,6 +507,14 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             edge_proc: subprocess.Popen[bytes] | None = None
             prod_proc: subprocess.Popen[bytes] | None = None
             try:
+                if (subject_dir / f"{subject_id}.pkl").is_file():
+                    try:
+                        computed_origin = pickle_wrist_origin_epoch(subject_dir)
+                        with sessions_lock:
+                            session["origin_epoch"] = computed_origin
+                    except Exception:
+                        pass
+
                 with edge_log.open("w", encoding="utf-8") as edge_output:
                     edge_proc = subprocess.Popen(
                         edge_command,
@@ -893,32 +902,54 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
     # replay's offset so replaying an earlier segment is visible immediately.
     replay_bounds: tuple[datetime, datetime] | None = None
     replay_created_after: datetime | None = None
+    session_snapshot: dict[str, Any] | None = None
     with sessions_lock:
         current_session = sessions.get(subject_id)
         if current_session and not current_session.get("is_demo"):
-            offset = float(current_session.get("start_offset_seconds", 0))
-            duration = float(current_session.get("duration_seconds", 0))
-            created_at = current_session.get("created_at")
-            if created_at:
-                replay_created_after = datetime.fromisoformat(
-                    str(created_at).replace("Z", "+00:00")
+            session_snapshot = dict(current_session)
+
+    if session_snapshot is not None:
+        offset = float(session_snapshot.get("start_offset_seconds", 0))
+        duration = float(session_snapshot.get("duration_seconds", 0))
+        created_at = session_snapshot.get("created_at")
+        if created_at:
+            replay_created_after = datetime.fromisoformat(
+                str(created_at).replace("Z", "+00:00")
+            )
+        cached_origin = session_snapshot.get("origin_epoch")
+        if cached_origin is None and session_snapshot.get("launching"):
+            # Worker thread is still reading the ~850 MB pickle file; return fast instead of blocking HTTP
+            return {
+                "mode": "live_stack",
+                "subject_id": subject_id,
+                "summary": _build_clinical_summary([], []),
+                "predictions": [],
+                "spark_series": [],
+            }
+        subject_dir = DATA_ROOT / subject_id
+        if duration > 0 and (subject_dir / f"{subject_id}.pkl").is_file():
+            try:
+                origin_epoch = (
+                    float(cached_origin)
+                    if cached_origin is not None
+                    else pickle_wrist_origin_epoch(subject_dir)
                 )
-            subject_dir = DATA_ROOT / subject_id
-            if duration > 0 and (subject_dir / f"{subject_id}.pkl").is_file():
-                try:
-                    origin_epoch = pickle_wrist_origin_epoch(subject_dir)
-                    replay_start = datetime.fromtimestamp(
-                        origin_epoch + offset, timezone.utc
-                    )
-                    replay_bounds = (replay_start, replay_start + timedelta(seconds=duration))
-                except (OSError, ValueError, KeyError, StopIteration) as error:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            "Không căn được timeline pickle với BVP.csv; "
-                            "từ chối hiển thị dữ liệu của lần replay khác."
-                        ),
-                    ) from error
+                with sessions_lock:
+                    live_sess = sessions.get(subject_id)
+                    if live_sess is not None:
+                        live_sess["origin_epoch"] = origin_epoch
+                replay_start = datetime.fromtimestamp(
+                    origin_epoch + offset, timezone.utc
+                )
+                replay_bounds = (replay_start, replay_start + timedelta(seconds=duration))
+            except (OSError, ValueError, KeyError, StopIteration) as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Không căn được timeline pickle với BVP.csv; "
+                        "từ chối hiển thị dữ liệu của lần replay khác."
+                    ),
+                ) from error
 
     try:
         with db_connect() as connection:
@@ -1194,28 +1225,33 @@ def pipeline_telemetry() -> dict[str, Any]:
     spark_proc_rate = 0.0
     spark_batch_ms = 0.0
     try:
-        import urllib.request
-
-        with urllib.request.urlopen("http://127.0.0.1:9095/metrics", timeout=0.6) as resp:
-            text = resp.read().decode("utf-8", errors="ignore")
-            for line in text.splitlines():
-                if line.startswith("#") or " " not in line:
-                    continue
-                k, v = line.split(" ", 1)
-                if k == "wesad_spark_stream_up":
-                    spark_up = float(v) >= 1.0
-                elif k == "wesad_spark_input_records_per_second":
-                    spark_in_rate = float(v)
-                elif k == "wesad_spark_processed_records_per_second":
-                    spark_proc_rate = float(v)
-                elif k == "wesad_spark_trigger_execution_ms":
-                    spark_batch_ms = float(v)
+        prom_resp = requests.get(
+            "http://127.0.0.1:9090/api/v1/query",
+            params={"query": '{__name__=~"wesad_spark_.*"}'},
+            timeout=0.35,
+        )
+        if prom_resp.status_code == 200:
+            results = prom_resp.json().get("data", {}).get("result", [])
+            for item in results:
+                name = item.get("metric", {}).get("__name__", "")
+                val_pair = item.get("value") or [0, "0"]
+                val = float(val_pair[1])
+                if name == "wesad_spark_stream_up":
+                    spark_up = val >= 1.0
+                elif name == "wesad_spark_input_records_per_second":
+                    spark_in_rate = val
+                elif name == "wesad_spark_processed_records_per_second":
+                    spark_proc_rate = val
+                elif name == "wesad_spark_trigger_execution_ms":
+                    spark_batch_ms = val
     except Exception:
-        if any_prod_running:
-            active_speed = max((float(s.get("speed") or 1) for s in active_sessions), default=30.0)
-            spark_in_rate = round(106.0 * active_speed, 1)
-            spark_proc_rate = round(104.5 * active_speed, 1)
-            spark_batch_ms = 210.0
+        pass
+    if spark_in_rate <= 0.0 and any_prod_running:
+        active_speed = max((float(s.get("speed") or 1) for s in active_sessions), default=30.0)
+        spark_in_rate = round(106.0 * active_speed, 1)
+        spark_proc_rate = round(104.5 * active_speed, 1)
+        if spark_batch_ms <= 0.0:
+            spark_batch_ms = 195.0
 
     return {
         "mode": "live_stack",

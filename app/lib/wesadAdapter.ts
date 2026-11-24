@@ -95,7 +95,7 @@ interface RawRegistryModel {
   created_at: string;
 }
 
-async function fetchJsonWithTimeout<T>(url: string, init?: RequestInit, timeoutMs = 3200): Promise<T> {
+async function fetchJsonWithTimeout<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -105,7 +105,10 @@ async function fetchJsonWithTimeout<T>(url: string, init?: RequestInit, timeoutM
       signal: controller.signal,
     });
     if (!res.ok) {
-      let detail = `HTTP ${res.status}`;
+      let detail =
+        res.status === 500 || res.status === 502
+          ? "Chưa bật tiến trình uvicorn cổng 8001 (hoặc cổng 8001 đang bận)"
+          : `HTTP ${res.status}`;
       try {
         const errBody = await res.json();
         if (errBody?.detail) detail = String(errBody.detail);
@@ -115,6 +118,16 @@ async function fetchJsonWithTimeout<T>(url: string, init?: RequestInit, timeoutM
       throw new Error(detail);
     }
     return (await res.json()) as T;
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      (err.name === "AbortError" || err.message.includes("aborted"))
+    ) {
+      throw new Error(
+        "Quá thời gian chờ phản hồi từ cổng 8001 — kiểm tra cửa sổ chạy uvicorn scripts.device_manager_api:app"
+      );
+    }
+    throw err;
   } finally {
     clearTimeout(id);
   }
