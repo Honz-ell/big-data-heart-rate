@@ -272,22 +272,51 @@ def select_scenario_slice(
         cands = [
             i
             for i in range(min(2, n - 1), max(1, n - win_count))
-            if windows[i]["base_share"] >= 0.9
+            if all(windows[k]["base_share"] >= 0.8 for k in range(i, i + win_count))
         ]
+        if not cands:
+            cands = [
+                i
+                for i in range(min(2, n - 1), max(1, n - win_count))
+                if windows[i]["base_share"] >= 0.8
+            ]
         if cands:
-            start_idx = min(cands, key=lambda i: rf_scores[i] + windows[i]["acc_std"] * 0.02)
+            start_idx = min(
+                cands,
+                key=lambda i: rf_scores[i + win_count - 1] * 2.0
+                + max(rf_scores[i : i + win_count])
+                + windows[i + win_count - 1]["acc_std"] * 0.02,
+            )
     elif scenario_id == "tsst_acute_stress":
-        cands = [i for i in range(max(1, n - win_count)) if windows[i]["stress_share"] >= 0.8]
+        cands = [
+            i
+            for i in range(max(1, n - win_count))
+            if windows[i + win_count - 1]["stress_share"] >= 0.7
+            or windows[i]["stress_share"] >= 0.8
+        ]
         if cands:
             start_idx = max(
                 cands,
-                key=lambda i: sum(rf_scores[i : i + win_count]) / win_count
-                + min(sum(w["eda_mean"] for w in windows[i : i + win_count]) / win_count, 10.0) * 0.04,
+                key=lambda i: rf_scores[i + win_count - 1] * 2.2
+                + sum(rf_scores[i : i + win_count]) / win_count
+                + min(windows[i + win_count - 1]["eda_mean"], 10.0) * 0.03,
             )
     elif scenario_id == "stress_to_recovery":
         stress_idx = [i for i, w in enumerate(windows) if w["stress_share"] >= 0.8]
         if stress_idx:
-            start_idx = max(0, min(n - win_count, stress_idx[-1] - 2))
+            lo = max(0, stress_idx[-1] - 2)
+            hi = min(n - win_count, stress_idx[-1] + 22)
+            if hi >= lo:
+                cands = list(range(lo, hi + 1))
+                start_idx = max(
+                    cands,
+                    key=lambda i: (
+                        max(rf_scores[i : i + 2]) - rf_scores[i + win_count - 1]
+                    )
+                    - rf_scores[i + win_count - 1] * 1.4,
+                )
+            else:
+                start_idx = max(0, min(n - win_count, stress_idx[-1] - 2))
     elif scenario_id == "physical_activity_check":
         cands = [
             i
@@ -295,10 +324,21 @@ def select_scenario_slice(
             if all(windows[k]["stress_share"] == 0.0 for k in range(i, min(n, i + win_count)))
         ]
         if cands:
-            start_idx = max(
-                cands,
-                key=lambda i: sum(w["acc_std"] for w in windows[i : i + 2]) * 0.5 - rf_scores[i] * 2.5,
-            )
+            def _motion_rank(i: int) -> float:
+                end_w = windows[i + win_count - 1]
+                act = end_w["vitals_base"].get("activity_state")
+                act_bonus = (
+                    12.0
+                    if act == "HIGH_ACTIVITY"
+                    else (4.5 if act == "LIGHT_ACTIVITY" else 0.0)
+                )
+                return (
+                    act_bonus
+                    + min(end_w["acc_std"], 14.0) * 0.6
+                    - rf_scores[i + win_count - 1] * 4.5
+                )
+
+            start_idx = max(cands, key=_motion_rank)
 
     chosen = windows[start_idx : start_idx + win_count]
     chosen_scores = rf_scores[start_idx : start_idx + win_count]

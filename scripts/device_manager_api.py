@@ -1038,21 +1038,25 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
             else:
                 pred_rows = connection.execute(
                     """
-                    WITH latest_run AS (
-                        SELECT MAX(created_at) AS max_ts
+                    WITH newest AS (
+                        SELECT window_start, created_at
                         FROM stress_predictions
                         WHERE subject_id = %s
+                        ORDER BY created_at DESC, window_start DESC
+                        LIMIT 1
                     )
                     SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
                            p.model_score_stress, p.model_file, p.model_version,
                            p.sample_counts, p.vitals,
                            f.verdict AS feedback_verdict, f.note AS feedback_note
                     FROM stress_predictions p
-                    CROSS JOIN latest_run lr
+                    JOIN newest nw
+                      ON p.window_start BETWEEN nw.window_start - INTERVAL '180 seconds'
+                                            AND nw.window_start
+                     AND p.created_at >= nw.created_at - INTERVAL '15 seconds'
                     LEFT JOIN prediction_feedback f
                       ON f.subject_id = p.subject_id AND f.window_start = p.window_start
                     WHERE p.subject_id = %s
-                      AND (lr.max_ts IS NULL OR p.created_at >= lr.max_ts - INTERVAL '90 seconds')
                     ORDER BY p.window_start DESC
                     LIMIT %s
                     """,
@@ -1399,7 +1403,7 @@ def team_summary() -> dict[str, Any]:
                 ),
                 newest AS (
                     SELECT DISTINCT ON (subject_id)
-                        subject_id, window_start AS anchor_ws
+                        subject_id, window_start AS anchor_ws, created_at AS anchor_ct
                     FROM stress_predictions
                     ORDER BY subject_id, created_at DESC, window_start DESC
                 ),
@@ -1418,8 +1422,9 @@ def team_summary() -> dict[str, Any]:
                     FROM stress_predictions p
                     JOIN newest nw
                       ON nw.subject_id = p.subject_id
-                     AND p.window_start BETWEEN nw.anchor_ws - INTERVAL '240 seconds'
-                                            AND nw.anchor_ws + INTERVAL '60 seconds'
+                     AND p.window_start BETWEEN nw.anchor_ws - INTERVAL '180 seconds'
+                                            AND nw.anchor_ws
+                     AND p.created_at >= nw.anchor_ct - INTERVAL '15 seconds'
                     JOIN counts c ON c.subject_id = p.subject_id
                 )
                 SELECT subject_id, window_start, window_end, prediction,
