@@ -185,8 +185,7 @@ export function TeamTab({
               {displayedStressedRatio}%
             </span>
             <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
-              ({displayedStressedCount}/{displayedDenominator}{" "}
-              {strictRealOnly ? "thiết bị đã đo thật" : "thành viên"})
+              ({displayedStressedCount}/{displayedDenominator} người đang căng thẳng)
             </span>
           </div>
           <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>

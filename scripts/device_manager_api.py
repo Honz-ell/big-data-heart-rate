@@ -1392,12 +1392,16 @@ def team_summary() -> dict[str, Any]:
         with db_connect() as connection:
             ranked_rows = connection.execute(
                 """
-                WITH latest_batch AS (
-                    SELECT subject_id,
-                           MAX(created_at) AS max_created_at,
-                           COUNT(*) AS total_cnt
+                WITH counts AS (
+                    SELECT subject_id, COUNT(*) AS total_cnt
                     FROM stress_predictions
                     GROUP BY subject_id
+                ),
+                newest AS (
+                    SELECT DISTINCT ON (subject_id)
+                        subject_id, window_start AS anchor_ws
+                    FROM stress_predictions
+                    ORDER BY subject_id, created_at DESC, window_start DESC
                 ),
                 ranked AS (
                     SELECT
@@ -1407,14 +1411,16 @@ def team_summary() -> dict[str, Any]:
                         p.prediction,
                         p.model_score_stress,
                         p.vitals,
-                        lb.total_cnt,
+                        c.total_cnt,
                         ROW_NUMBER() OVER (
                             PARTITION BY p.subject_id ORDER BY p.window_start DESC
                         ) AS rn
                     FROM stress_predictions p
-                    JOIN latest_batch lb
-                      ON lb.subject_id = p.subject_id
-                     AND p.created_at >= lb.max_created_at - INTERVAL '90 seconds'
+                    JOIN newest nw
+                      ON nw.subject_id = p.subject_id
+                     AND p.window_start BETWEEN nw.anchor_ws - INTERVAL '240 seconds'
+                                            AND nw.anchor_ws + INTERVAL '60 seconds'
+                    JOIN counts c ON c.subject_id = p.subject_id
                 )
                 SELECT subject_id, window_start, window_end, prediction,
                        model_score_stress, vitals, total_cnt
