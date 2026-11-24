@@ -203,3 +203,57 @@ def test_device_manager_and_registry_demo_endpoints() -> None:
         assert fb.status_code == 200
         tl2 = dev_client.get("/devices/S4/timeline").json()
         assert tl2["predictions"][0]["feedback"]["verdict"] == "ACCURATE"
+
+
+def test_resolve_subject_scenario_offsets_for_counterbalanced_subject(tmp_path) -> None:
+    import pickle
+    from wesad.pickle_reader import resolve_subject_scenario_offsets
+
+    subj_dir = tmp_path / "S9"
+    e4_dir = subj_dir / "S9_E4_Data"
+    e4_dir.mkdir(parents=True)
+
+    # 12 windows of 30s = 360 seconds total:
+    # Windows 0..3 (0..120s): Baseline (label == 1), calm ACC, low EDA
+    # Windows 4..5 (120..180s): Walking transition (label == 0), high ACC std, low EDA
+    # Windows 6..9 (180..300s): TSST Stress (label == 2), calm ACC, high EDA surge
+    # Windows 10..11 (300..360s): Meditation recovery (label == 4), calm ACC, low EDA
+    total_sec = 360
+    labels = np.zeros(total_sec * 700, dtype=np.int32)
+    labels[0 : 120 * 700] = 1
+    labels[180 * 700 : 300 * 700] = 2
+    labels[300 * 700 : 360 * 700] = 4
+
+    rng = np.random.default_rng(9)
+    acc = np.column_stack(
+        [
+            np.full(total_sec * 32, 62.0) + rng.normal(0.0, 0.4, total_sec * 32),
+            rng.normal(0.0, 0.4, total_sec * 32),
+            rng.normal(0.0, 0.4, total_sec * 32),
+        ]
+    )
+    # Vigorous motion during windows 4..5 (120..180s)
+    t_walk = np.arange(60 * 32) / 32.0
+    acc[120 * 32 : 180 * 32, 0] += 14.0 * np.sin(2.0 * np.pi * 2.0 * t_walk)
+
+    t_bvp = np.arange(total_sec * 64) / 64.0
+    bvp = (25.0 * np.sin(2.0 * np.pi * 1.2 * t_bvp) + rng.normal(0.0, 0.5, t_bvp.size)).reshape(-1, 1)
+    eda = np.full((total_sec * 4, 1), 0.35)
+    eda[180 * 4 : 300 * 4, 0] = 4.8  # TSST EDA surge on S9 at 180..300s
+    temp = np.full((total_sec * 4, 1), 32.8)
+
+    bvp_csv_lines = ["1500000000.000000", "64.000000", *(f"{float(v[0]):.4f}" for v in bvp)]
+    (e4_dir / "BVP.csv").write_text("\n".join(bvp_csv_lines) + "\n", encoding="utf-8")
+
+    payload = {
+        "label": labels,
+        "signal": {"wrist": {"ACC": acc, "BVP": bvp, "EDA": eda, "TEMP": temp}},
+    }
+    with (subj_dir / "S9.pkl").open("wb") as handle:
+        pickle.dump(payload, handle)
+
+    offsets = resolve_subject_scenario_offsets(subj_dir)
+    assert 180 <= offsets["tsst_acute_stress"] <= 270
+    assert 120 <= offsets["physical_activity_check"] <= 150
+    assert offsets["stress_to_recovery"] == 210
+

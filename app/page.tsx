@@ -43,6 +43,7 @@ export default function HomePage() {
   const [breathingOpen, setBreathingOpen] = useState<boolean>(false);
   const [tickSeed, setTickSeed] = useState<number>(1);
   const [retryCountdown, setRetryCountdown] = useState<number>(3);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // 4-Step Demo Guide auto-tracking
   const [checklist, setChecklist] = useState<DemoChecklistState>({
@@ -53,6 +54,7 @@ export default function HomePage() {
   });
 
   const inFlightRef = useRef<boolean>(false);
+  const reqSeqRef = useRef<number>(0);
 
   // Sync theme attribute on <html>
   useEffect(() => {
@@ -73,14 +75,23 @@ export default function HomePage() {
   };
 
   const loadBundle = useCallback(
-    async (seedOverride?: number) => {
-      if (inFlightRef.current) return;
+    async (
+      seedOverride?: number,
+      overrides?: {
+        force?: boolean;
+        subjectId?: string;
+        scenarioId?: ScenarioId;
+        speed?: number;
+      }
+    ) => {
+      if (inFlightRef.current && !overrides?.force) return;
       inFlightRef.current = true;
+      const mySeq = ++reqSeqRef.current;
       try {
         const res = await fetchDashboardBundle({
-          subjectId,
-          scenarioId,
-          speed,
+          subjectId: overrides?.subjectId ?? subjectId,
+          scenarioId: overrides?.scenarioId ?? scenarioId,
+          speed: overrides?.speed ?? speed,
           forceMockMode,
           pausedLocally,
           mockVisibleWindows,
@@ -89,9 +100,13 @@ export default function HomePage() {
           localFeedbackMap,
           tickSeed: seedOverride ?? tickSeed,
         });
-        setBundle(res);
+        if (mySeq === reqSeqRef.current) {
+          setBundle(res);
+        }
       } finally {
-        inFlightRef.current = false;
+        if (mySeq === reqSeqRef.current) {
+          inFlightRef.current = false;
+        }
         setInitialLoading(false);
       }
     },
@@ -134,11 +149,30 @@ export default function HomePage() {
 
   const handleLaunchScenario = async (nextScenario: ScenarioId) => {
     const spec = DEMO_SCENARIOS.find((s) => s.id === nextScenario) ?? DEMO_SCENARIOS[0];
+    setActionError(null);
     setScenarioId(nextScenario);
     setSpeed(spec.default_speed);
     setPausedLocally(false);
     setMockStreamState("running");
     setMockVisibleWindows(5);
+
+    // Clear stale previous-session chart immediately on live stack so user sees active loading state
+    if (!forceMockMode && bundle?.apiConnected) {
+      setBundle((prev) =>
+        prev
+          ? {
+              ...prev,
+              personal: {
+                ...prev.personal,
+                streamState: "starting",
+                sparkSeries: [],
+                edgeWindows: [],
+                events: [],
+              },
+            }
+          : prev
+      );
+    }
 
     // Auto-mark demo walkthrough steps
     setChecklist((prev) => ({
@@ -151,26 +185,54 @@ export default function HomePage() {
       ranMotionShield: prev.ranMotionShield || nextScenario === "physical_activity_check",
     }));
 
-    await startScenarioOnApi({
+    const startRes = await startScenarioOnApi({
       subjectId,
       scenarioId: nextScenario,
       speed: spec.default_speed,
       forceMockMode,
     });
-    void loadBundle(tickSeed + 1);
+    if (!forceMockMode && !startRes.usedApi && startRes.error) {
+      setActionError(startRes.error);
+    }
+    void loadBundle(tickSeed + 1, {
+      force: true,
+      subjectId,
+      scenarioId: nextScenario,
+      speed: spec.default_speed,
+    });
   };
 
   const handleStart = async () => {
+    setActionError(null);
     setPausedLocally(false);
     setMockStreamState("running");
     setMockVisibleWindows((w) => (w < 4 ? 5 : w));
-    await startScenarioOnApi({
+    if (!forceMockMode && bundle?.apiConnected) {
+      setBundle((prev) =>
+        prev
+          ? {
+              ...prev,
+              personal: {
+                ...prev.personal,
+                streamState: "starting",
+                sparkSeries: [],
+                edgeWindows: [],
+                events: [],
+              },
+            }
+          : prev
+      );
+    }
+    const startRes = await startScenarioOnApi({
       subjectId,
       scenarioId,
       speed,
       forceMockMode,
     });
-    void loadBundle(tickSeed + 1);
+    if (!forceMockMode && !startRes.usedApi && startRes.error) {
+      setActionError(startRes.error);
+    }
+    void loadBundle(tickSeed + 1, { force: true });
   };
 
   const handleTogglePause = () => {
@@ -255,6 +317,29 @@ export default function HomePage() {
           theme={theme}
           onToggleTheme={toggleTheme}
         />
+
+        {/* Action Error Banner (e.g. missing .pkl or model file when clicking Start) */}
+        {actionError && !forceMockMode && (
+          <div
+            role="alert"
+            className="rounded-2xl px-4 py-3 text-xs sm:text-sm font-semibold flex flex-wrap items-center justify-between gap-2"
+            style={{
+              backgroundColor: "var(--crimson-soft)",
+              color: "var(--crimson)",
+              border: "1px solid var(--crimson)",
+            }}
+          >
+            <span>⚠ Không thể khởi chạy kịch bản trên máy chủ: {actionError}</span>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              className="rounded-lg px-3 py-1 text-xs font-extrabold cursor-pointer"
+              style={{ backgroundColor: "var(--crimson)", color: "#ffffff" }}
+            >
+              Đóng
+            </button>
+          </div>
+        )}
 
         {/* Yellow Auto-Reconnect Banner when Live API is unreachable (unless user explicitly enabled Mock mode) */}
         {bundle && !bundle.apiConnected && !forceMockMode && (

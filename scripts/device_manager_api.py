@@ -25,7 +25,10 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from wesad.demo_simulator import SCENARIO_CATALOG, generate_scenario_windows  # noqa: E402
-from wesad.pickle_reader import pickle_wrist_origin_epoch  # noqa: E402
+from wesad.pickle_reader import (  # noqa: E402
+    pickle_wrist_origin_epoch,
+    resolve_subject_scenario_offsets,
+)
 from wesad.replay_clock import ensure_replay_clock  # noqa: E402
 from wesad.vitals import classify_activity  # noqa: E402
 
@@ -67,9 +70,23 @@ _cached_rf_bundle: dict[str, Any] | None = None
 _db_pool: ConnectionPool | None = None
 
 
+def _resolve_default_model_path() -> Path | None:
+    candidates = [
+        DEFAULT_MODEL,
+        PROJECT_ROOT / "models" / "v1.0.0.joblib",
+        PROJECT_ROOT / "models" / "stress_rf_no_s4.joblib",
+        FALLBACK_MODEL,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    any_models = sorted((PROJECT_ROOT / "models").glob("*.joblib"))
+    return any_models[0] if any_models else None
+
+
 def _load_local_rf() -> tuple[Any, str, str | None]:
     global _cached_rf_bundle
-    model_path = DEFAULT_MODEL if DEFAULT_MODEL.is_file() else FALLBACK_MODEL
+    model_path = _resolve_default_model_path() or FALLBACK_MODEL
     if _cached_rf_bundle is None:
         _cached_rf_bundle = joblib.load(model_path)
     active_version: str | None = _cached_rf_bundle.get("model_version") or "v1.0.0"
@@ -911,11 +928,15 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
     if session_snapshot is not None:
         offset = float(session_snapshot.get("start_offset_seconds", 0))
         duration = float(session_snapshot.get("duration_seconds", 0))
-        created_at = session_snapshot.get("created_at")
-        if created_at:
-            replay_created_after = datetime.fromisoformat(
-                str(created_at).replace("Z", "+00:00")
-            )
+        db_started_at = session_snapshot.get("db_started_at")
+        if isinstance(db_started_at, datetime):
+            replay_created_after = db_started_at
+        else:
+            created_at = session_snapshot.get("created_at")
+            if created_at:
+                replay_created_after = datetime.fromisoformat(
+                    str(created_at).replace("Z", "+00:00")
+                ) - timedelta(seconds=30)
         cached_origin = session_snapshot.get("origin_epoch")
         if cached_origin is None and session_snapshot.get("launching"):
             # Worker thread is still reading the ~850 MB pickle file; return fast instead of blocking HTTP
@@ -941,7 +962,11 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
                 replay_start = datetime.fromtimestamp(
                     origin_epoch + offset, timezone.utc
                 )
-                replay_bounds = (replay_start, replay_start + timedelta(seconds=duration))
+                # Pad -15s / +30s so Edge's floor_to_10s(event_time) Window #0 and final window are never clipped
+                replay_bounds = (
+                    replay_start - timedelta(seconds=15),
+                    replay_start + timedelta(seconds=duration + 30),
+                )
             except (OSError, ValueError, KeyError, StopIteration) as error:
                 raise HTTPException(
                     status_code=503,

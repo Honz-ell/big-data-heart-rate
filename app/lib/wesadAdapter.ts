@@ -420,34 +420,43 @@ export async function fetchDashboardBundle(params: {
           );
 
     if (edgeWindows.length === 0) {
+      const latestSparkPt = effectiveSpark.at(-1);
+      const liveHr = latestSparkPt?.hr_bpm ?? null;
       const emptyPersonal: PersonalDashboardData = {
         subjectId: params.subjectId,
         roleLabel: subjMeta.role,
         usingMockFallback: false,
         connectionState: "connected",
-        simulatedClockUtc: "--:--:--",
+        simulatedClockUtc: latestSparkPt ? fmtClockShort(latestSparkPt.window_end_utc) : "--:--:--",
         streamState,
         currentScore: 0,
         currentZone: "RELAXED",
         motionShieldActive: false,
         heroConclusion:
           streamState === "starting" || streamState === "running"
-            ? "Đang thu thập cửa sổ cảm biến 30 giây đầu tiên từ luồng Kafka & Spark..."
+            ? effectiveSpark.length > 0
+              ? "⚡ Luồng Spark 10s đã nhận dữ liệu cảm biến trực tiếp — đang gom đủ 30 giây đầu tiên để mô hình Edge AI phân loại Stress..."
+              : `Đang nạp dữ liệu thật ${params.subjectId}.pkl và thu thập cửa sổ 30 giây đầu tiên từ Kafka & Spark...`
             : "Chưa có dữ liệu phiên hiện tại. Nhấn ▶ Start hoặc chọn 1 kịch bản bên trên để bắt đầu.",
         confidencePercent: 0,
         activeModelVersion,
         vitals: {
-          hrBpm: effectiveSpark.at(-1)?.hr_bpm ?? null,
+          hrBpm: liveHr,
           baselineHrBpm: subjMeta.baselineHr,
-          hrDeltaBpm: null,
+          hrDeltaBpm: liveHr !== null ? +(liveHr - subjMeta.baselineHr).toFixed(1) : null,
           hrvRmssdMs: null,
           baselineHrvMs: 60,
-          edaUs: effectiveSpark.at(-1)?.eda_us ?? null,
+          edaUs: latestSparkPt?.eda_us ?? null,
           baselineEdaUs: subjMeta.baselineEda,
-          tempC: effectiveSpark.at(-1)?.temp_c ?? null,
+          tempC: latestSparkPt?.temp_c ?? null,
           baselineTempC: 32.9,
-          activityState: "RESTING",
-          accG: effectiveSpark.at(-1)?.acc_g ?? null,
+          activityState:
+            (latestSparkPt?.acc_g ?? 0) >= 0.055
+              ? "HIGH_ACTIVITY"
+              : (latestSparkPt?.acc_g ?? 0) >= 0.02
+                ? "LIGHT_ACTIVITY"
+                : "RESTING",
+          accG: latestSparkPt?.acc_g ?? null,
         },
         sparkSeries: effectiveSpark,
         edgeWindows: [],
@@ -609,7 +618,7 @@ export async function startScenarioOnApi(params: {
   scenarioId: ScenarioId;
   speed: number;
   forceMockMode: boolean;
-}): Promise<{ usedApi: boolean }> {
+}): Promise<{ usedApi: boolean; error?: string }> {
   if (params.forceMockMode) return { usedApi: false };
   const spec = DEMO_SCENARIOS.find((s) => s.id === params.scenarioId) ?? DEMO_SCENARIOS[0];
   try {
@@ -626,8 +635,11 @@ export async function startScenarioOnApi(params: {
       }),
     });
     return { usedApi: true };
-  } catch {
-    return { usedApi: false };
+  } catch (err) {
+    return {
+      usedApi: false,
+      error: err instanceof Error ? err.message : "Không khởi động được kịch bản trên API",
+    };
   }
 }
 

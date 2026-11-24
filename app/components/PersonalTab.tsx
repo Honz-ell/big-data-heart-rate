@@ -233,27 +233,44 @@ export function PersonalTab({
   }, [data.sparkSeries, data.edgeWindows, data.events, rangeMinutes]);
 
   if (data.edgeWindows.length === 0 && data.sparkSeries.length === 0) {
+    const isWarmingUp = data.streamState === "starting" || data.streamState === "running";
     return (
       <section className="surface-card p-10 text-center space-y-4">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl text-2xl" style={{ backgroundColor: "var(--emerald-soft)", color: "var(--emerald)" }}>
-          ▶
+        <div
+          className={`mx-auto flex h-14 w-14 items-center justify-center rounded-2xl text-2xl ${isWarmingUp ? "animate-pulse" : ""}`}
+          style={{
+            backgroundColor: isWarmingUp ? "var(--sky-soft)" : "var(--emerald-soft)",
+            color: isWarmingUp ? "var(--sky)" : "var(--emerald)",
+          }}
+        >
+          {isWarmingUp ? "⚡" : "▶"}
         </div>
         <h2 className="text-xl font-extrabold" style={{ color: "var(--ink)" }}>
-          {data.streamState === "starting" || data.streamState === "running"
-            ? "Đang thu thập cửa sổ cảm biến 30 giây đầu tiên..."
+          {isWarmingUp
+            ? `Đang nạp dữ liệu thật ${data.subjectId}.pkl vào Kafka & Spark...`
             : "Chưa có dữ liệu phiên theo dõi"}
         </h2>
         <p className="mx-auto max-w-lg text-sm" style={{ color: "var(--muted)" }}>
-          Nhấn nút <strong>▶ Start</strong> trên thanh điều khiển hoặc chọn một trong 4 kịch bản mẫu bên trên để phát luồng cảm biến đồng hồ Empatica E4 qua Kafka &amp; Spark.
+          {isWarmingUp ? (
+            <>
+              Tiến trình Producer &amp; Edge AI đang đọc file gốc WESAD của <strong>{data.subjectId}</strong>, căn chỉnh đúng phân đoạn kịch bản và gom cửa sổ 10s/30s đầu tiên. Biểu đồ sẽ tự động nhảy sau khoảng <strong>5–10 giây</strong>...
+            </>
+          ) : (
+            <>
+              Nhấn nút <strong>▶ Start</strong> trên thanh điều khiển hoặc chọn một trong 4 kịch bản mẫu bên trên để phát luồng cảm biến đồng hồ Empatica E4 qua Kafka &amp; Spark.
+            </>
+          )}
         </p>
-        <button
-          type="button"
-          onClick={onStartQuick}
-          className="rounded-xl px-5 py-2.5 text-sm font-bold text-white cursor-pointer"
-          style={{ backgroundColor: "var(--emerald)" }}
-        >
-          ▶ Bắt đầu kịch bản mẫu ngay
-        </button>
+        {!isWarmingUp && (
+          <button
+            type="button"
+            onClick={onStartQuick}
+            className="rounded-xl px-5 py-2.5 text-sm font-bold text-white cursor-pointer"
+            style={{ backgroundColor: "var(--emerald)" }}
+          >
+            ▶ Bắt đầu kịch bản mẫu ngay
+          </button>
+        )}
       </section>
     );
   }
