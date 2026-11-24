@@ -3,7 +3,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { BreathingModal } from "./components/BreathingModal";
 import { ControlBar } from "./components/ControlBar";
-import { DemoChecklistState, DemoGuideWidget } from "./components/DemoGuideWidget";
 import { PersonalTab } from "./components/PersonalTab";
 import { SystemModelTab } from "./components/SystemModelTab";
 import { TeamTab } from "./components/TeamTab";
@@ -45,14 +44,6 @@ export default function HomePage() {
   const [tickSeed, setTickSeed] = useState<number>(1);
   const [retryCountdown, setRetryCountdown] = useState<number>(3);
   const [actionError, setActionError] = useState<string | null>(null);
-
-  // 4-Step Demo Guide auto-tracking
-  const [checklist, setChecklist] = useState<DemoChecklistState>({
-    ranBaseline: true,
-    ranStressAndAlert: false,
-    ranMotionShield: false,
-    swappedModel: false,
-  });
 
   const inFlightRef = useRef<boolean>(false);
   const reqSeqRef = useRef<number>(0);
@@ -172,17 +163,6 @@ export default function HomePage() {
     setPausedLocally(false);
     setMockStreamState("running");
     setMockVisibleWindows(5);
-
-    // Auto-mark demo walkthrough steps
-    setChecklist((prev) => ({
-      ...prev,
-      ranBaseline: prev.ranBaseline || nextScenario === "baseline_calm",
-      ranStressAndAlert:
-        prev.ranStressAndAlert ||
-        nextScenario === "tsst_acute_stress" ||
-        nextScenario === "stress_to_recovery",
-      ranMotionShield: prev.ranMotionShield || nextScenario === "physical_activity_check",
-    }));
 
     // When user is viewing Tab 2 ("Theo dõi nhóm"), run the chosen scenario sequentially across ALL 15 subjects!
     if (activeTab === "team") {
@@ -311,7 +291,6 @@ export default function HomePage() {
 
   const handleActivateModel = async (version: string) => {
     setMockActiveModel(version);
-    setChecklist((prev) => ({ ...prev, swappedModel: true }));
     await activateModelVersion(version, forceMockMode);
     await loadBundle(tickSeed + 1);
   };
@@ -457,13 +436,6 @@ export default function HomePage() {
       <BreathingModal
         open={breathingOpen}
         onClose={() => setBreathingOpen(false)}
-      />
-
-      {/* 4-Step Auto-Check Demo Guide Corner Widget */}
-      <DemoGuideWidget
-        completed={checklist}
-        onTriggerScenario={(id) => void handleLaunchScenario(id)}
-        onSwitchTab={setActiveTab}
       />
     </div>
   );
