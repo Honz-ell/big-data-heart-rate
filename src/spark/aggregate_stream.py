@@ -116,7 +116,13 @@ def parse_args() -> argparse.Namespace:
 
 def write_microbatch_to_postgres(batch_df, batch_id: int, args: argparse.Namespace) -> None:
     """Write each completed Spark window batch through Spark's JDBC data source."""
-    output = batch_df.withColumn("spark_batch_id", F.lit(batch_id).cast("long"))
+    output = (
+        batch_df.where(F.col("sensor") != "__CONTROL__")
+        .withColumn("spark_batch_id", F.lit(batch_id).cast("long"))
+    )
+    if not output.take(1):
+        print(f"Spark micro-batch #{batch_id} chỉ chứa bản tin điều khiển watermark.")
+        return
     (
         output.write.format("jdbc")
         .option("url", args.postgres_url)
@@ -154,38 +160,61 @@ def main() -> None:
     events = decoded.select(
         F.get_json_object("json", "$.subject_id").alias("subject_id"),
         F.to_timestamp(F.get_json_object("json", "$.timestamp")).alias("event_time"),
+        F.to_timestamp(
+            F.coalesce(
+                F.get_json_object("json", "$.stream_timestamp"),
+                F.get_json_object("json", "$.timestamp"),
+            )
+        ).alias("stream_time"),
+        F.coalesce(
+            F.get_json_object("json", "$.replay_shift_seconds").cast("double"),
+            F.lit(0.0),
+        ).alias("replay_shift_seconds"),
         F.get_json_object("json", "$.sensor").alias("sensor"),
         F.get_json_object("json", "$.unit").alias("unit"),
         F.get_json_object("json", "$.value").alias("value_json"),
     )
 
-    scalar_value = F.col("value_json").cast("double")
-    acc_x = F.get_json_object("value_json", "$.x").cast("double")
-    acc_y = F.get_json_object("value_json", "$.y").cast("double")
-    acc_z = F.get_json_object("value_json", "$.z").cast("double")
+    scalar_value = F.expr("try_cast(value_json AS DOUBLE)")
+    ibi_interval = F.coalesce(
+        F.expr("try_cast(get_json_object(value_json, '$.interval') AS DOUBLE)"),
+        scalar_value,
+    )
+    acc_x = F.expr("try_cast(get_json_object(value_json, '$.x') AS DOUBLE)")
+    acc_y = F.expr("try_cast(get_json_object(value_json, '$.y') AS DOUBLE)")
+    acc_z = F.expr("try_cast(get_json_object(value_json, '$.z') AS DOUBLE)")
     acc_magnitude = F.sqrt(F.pow(acc_x, 2) + F.pow(acc_y, 2) + F.pow(acc_z, 2))
     valid_measurement = (
         F.col("measurement").isNotNull()
         & ((F.col("sensor") != "TEMP") | F.col("measurement").between(20.0, 45.0))
         & ((F.col("sensor") != "HR") | F.col("measurement").between(35.0, 210.0))
         & ((F.col("sensor") != "EDA") | F.col("measurement").between(0.0, 60.0))
+        & ((F.col("sensor") != "IBI") | F.col("measurement").between(0.30, 2.00))
     )
 
     measurable = (
         events.withColumn(
             "measurement",
-            F.when(F.col("sensor") == "ACC", acc_magnitude).otherwise(scalar_value),
+            F.when(F.col("sensor") == "ACC", acc_magnitude)
+            .when(F.col("sensor") == "IBI", ibi_interval)
+            .otherwise(scalar_value),
         )
         .where(
             F.col("subject_id").isNotNull()
             & F.col("event_time").isNotNull()
+            & F.col("stream_time").isNotNull()
             & valid_measurement
         )
+        .withWatermark("stream_time", args.watermark)
     )
 
     aggregates = (
         measurable.groupBy(
-            F.window("event_time", args.window), "subject_id", "sensor", "unit"
+            F.window("stream_time", args.window),
+            "replay_shift_seconds",
+            "subject_id",
+            "sensor",
+            "unit",
         )
         .agg(
             F.count("*").alias("sample_count"),
@@ -194,8 +223,12 @@ def main() -> None:
             F.round(F.max("measurement"), 3).alias("max_value"),
         )
         .select(
-            F.col("window.start").alias("window_start_utc"),
-            F.col("window.end").alias("window_end_utc"),
+            F.timestamp_seconds(
+                F.col("window.start").cast("double") - F.col("replay_shift_seconds")
+            ).alias("window_start_utc"),
+            F.timestamp_seconds(
+                F.col("window.end").cast("double") - F.col("replay_shift_seconds")
+            ).alias("window_end_utc"),
             "subject_id",
             "sensor",
             "unit",
@@ -207,7 +240,7 @@ def main() -> None:
     )
 
     query = (
-        aggregates.writeStream.outputMode("update")
+        aggregates.writeStream.outputMode("append")
         .foreachBatch(
             lambda batch_df, batch_id: write_microbatch_to_postgres(
                 batch_df, batch_id, args

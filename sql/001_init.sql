@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS prediction_feedback (
     PRIMARY KEY (subject_id, window_start)
 );
 
+CREATE TABLE IF NOT EXISTS replay_stream_clock (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    reserved_until_epoch DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+INSERT INTO replay_stream_clock (singleton, reserved_until_epoch)
+VALUES (TRUE, 0)
+ON CONFLICT (singleton) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS model_versions (
     version TEXT PRIMARY KEY,
     model_file TEXT NOT NULL UNIQUE,

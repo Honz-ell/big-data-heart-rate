@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import pickle
 import sys
 from datetime import datetime, timezone
@@ -14,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from wesad.features import FEATURE_NAMES, SAMPLE_RATES_HZ, sensor_features  # noqa: E402
+from wesad.pickle_reader import calibrate_pickle_origin_epoch  # noqa: E402
 
 LABEL_RATE_HZ = 700
 STRESS_LABEL = 2
@@ -44,18 +44,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def recording_origin_utc(e4_dir: Path) -> datetime:
-    starts: list[float] = []
-    for sensor in ("ACC", "BVP", "EDA", "TEMP"):
-        path = e4_dir / f"{sensor}.csv"
-        with path.open("r", newline="", encoding="utf-8-sig") as handle:
-            first = next(csv.reader(handle), None)
-        if not first or not first[0].strip():
-            raise ValueError(f"Không tìm thấy mốc thời gian header trong {path}")
-        starts.append(float(first[0]))
-    return datetime.fromtimestamp(min(starts), timezone.utc)
-
-
 def main() -> int:
     args = parse_args()
     if args.window_seconds <= 0 or not 0.5 <= args.min_purity <= 1 or args.limit < 1:
@@ -78,7 +66,12 @@ def main() -> int:
             (key.decode("latin1") if isinstance(key, bytes) else str(key)).upper(): value
             for key, value in wrist.items()
         }
-        origin = recording_origin_utc(e4_dir)
+        origin_epoch, aligned = calibrate_pickle_origin_epoch(
+            subject_dir, np.asarray(wrist_by_name["BVP"])
+        )
+        if not aligned:
+            raise ValueError("Không căn chỉnh được timestamp pickle với BVP.csv")
+        origin = datetime.fromtimestamp(origin_epoch, timezone.utc)
     except (OSError, EOFError, pickle.UnpicklingError, KeyError, ValueError) as error:
         print(f"Không đọc được nhãn hoặc thời gian bắt đầu: {error}")
         return 1
@@ -108,7 +101,7 @@ def main() -> int:
         f"{args.subject}: cửa sổ={args.window_seconds}s, lớp cần liệt kê={label_text}, "
         f"độ thuần tối thiểu={args.min_purity:.0%}"
     )
-    print(f"Mốc bắt đầu E4 gần nhất: {origin.isoformat()}")
+    print(f"Mốc bắt đầu pickle đã căn với BVP.csv: {origin.isoformat()}")
     output_fields = "offset_seconds | thời gian UTC | độ thuần"
     if model is not None:
         output_fields += " | dự đoán model | điểm Stress"

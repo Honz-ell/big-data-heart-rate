@@ -21,10 +21,9 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 180,
         "speed": 30,
         "description": (
-            "Pha đọc báo / làm việc nhẹ lúc đầu phiên đo WESAD: cơ thể ngồi tĩnh, "
-            "nhịp tim ~70–74 BPM, HRV cao và dẫn điện da (EDA) phẳng."
+            "Phát lại đoạn baseline của participant S4 trong WESAD; xem các kênh cảm biến và kết quả mô hình."
         ),
-        "expected_outcome": "Không phát cảnh báo · Chỉ số căng thẳng thấp (< 30/100)",
+        "expected_outcome": "Đối chiếu dự đoán Non-Stress với nhãn baseline của dữ liệu.",
     },
     {
         "id": "tsst_acute_stress",
@@ -36,10 +35,9 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 180,
         "speed": 30,
         "description": (
-            "Bài kiểm tra Trier Social Stress Test (phỏng vấn & trừ nhẩm trước hội đồng): "
-            "người đeo ngồi/đứng tĩnh nhưng nhịp tim vọt > 100 BPM, HRV tụt sâu và EDA tăng vọt."
+            "Phát lại đoạn TSST được gắn nhãn Stress của participant S4; các chỉ số hiển thị lấy từ file cảm biến gốc."
         ),
-        "expected_outcome": "Cảnh báo căng thẳng kéo dài sau ≥ 3 cửa sổ (90s) + gợi ý hít thở",
+        "expected_outcome": "Quan sát dự đoán theo cửa sổ và so sánh với nhãn Stress trong WESAD.",
     },
     {
         "id": "stress_to_recovery",
@@ -51,25 +49,23 @@ SCENARIO_CATALOG: list[dict[str, Any]] = [
         "duration_seconds": 240,
         "speed": 40,
         "description": (
-            "Theo dõi 4 phút từ cuối bài áp lực sang giai đoạn nghỉ thư giãn: "
-            "quan sát nhịp tim hạ dần, HRV phục hồi và cảnh báo tự động giải tỏa."
+            "Phát lại đoạn chuyển tiếp trong recording S4; nhãn và chỉ số phản ánh dữ liệu được ghi nhận, không cam kết xu hướng sinh lý cụ thể."
         ),
-        "expected_outcome": "Đo được thời gian hồi phục (Recovery Time) sau đỉnh stress",
+        "expected_outcome": "Quan sát thời điểm dự đoán của mô hình chuyển từ Stress sang Non-Stress.",
     },
     {
         "id": "physical_activity_check",
-        "title": "Di chuyển nhanh / Chuyển pha (Chống báo giả)",
+        "title": "Đoạn có gia tốc cổ tay dao động",
         "badge": "Vận động",
         "tone": "motion",
         "subject_id": "S4",
-        "start_offset_seconds": 3540,
-        "duration_seconds": 150,
-        "speed": 35,
+        "start_offset_seconds": 2100,
+        "duration_seconds": 180,
+        "speed": 30,
         "description": (
-            "Giai đoạn đi bộ / cử động tay liên tục trước bài thi: gia tốc cổ tay (ACC) dao động lớn, "
-            "minh họa cách đa cảm biến phân biệt vận động thể chất với căng thẳng tâm lý lúc ngồi tĩnh."
+            "Quan sát ACC trong đoạn dữ liệu được chọn; không gán hoạt động cụ thể nếu nhãn hoạt động không có trong WESAD."
         ),
-        "expected_outcome": "Gắn nhãn 'Đang vận động' · Không báo động nhầm nhịp tim bất thường",
+        "expected_outcome": "Đối chiếu ACC với dự đoán Stress/Non-Stress; ACC không ghi đè nhãn mô hình.",
     },
 ]
 
@@ -83,6 +79,26 @@ def synthesize_ppg_bvp(
     sample_rate_hz: int = 64,
 ) -> np.ndarray:
     """Synthesize a realistic 64 Hz wrist PPG waveform with systolic + dicrotic wave and beat-to-beat HRV."""
+    signal, _, _ = _synthesize_ppg_bvp_with_ibi(
+        rng,
+        duration_seconds,
+        target_hr_bpm,
+        target_rmssd_ms,
+        amplitude,
+        sample_rate_hz,
+    )
+    return signal
+
+
+def _synthesize_ppg_bvp_with_ibi(
+    rng: np.random.Generator,
+    duration_seconds: int,
+    target_hr_bpm: float,
+    target_rmssd_ms: float,
+    amplitude: float,
+    sample_rate_hz: int = 64,
+) -> tuple[np.ndarray, list[float], list[dict[str, float]]]:
+    """Synthesize BVP plus HR/IBI channels from the same generated beat sequence."""
     total_samples = duration_seconds * sample_rate_hz
     t = np.arange(total_samples, dtype=np.float64) / float(sample_rate_hz)
     mean_ibi = 60.0 / max(42.0, min(165.0, target_hr_bpm))
@@ -90,15 +106,15 @@ def synthesize_ppg_bvp(
     beat_sd = (target_rmssd_ms / 1000.0) / np.sqrt(2.0)
 
     beat_times: list[float] = []
+    beat_intervals: list[float] = []
     cursor = 0.25
-    idx = 0
     while cursor < duration_seconds + mean_ibi:
         resp_mod = beat_sd * np.sin(2.0 * np.pi * 0.23 * cursor)
         jitter = float(rng.normal(0.0, beat_sd * 0.45))
         ibi = float(np.clip(mean_ibi + resp_mod + jitter, 0.37, 1.45))
         beat_times.append(cursor)
+        beat_intervals.append(ibi)
         cursor += ibi
-        idx += 1
 
     signal = np.zeros(total_samples, dtype=np.float64)
     for bt in beat_times:
@@ -115,7 +131,15 @@ def synthesize_ppg_bvp(
 
     signal -= np.mean(signal)
     signal += rng.normal(0.0, amplitude * 0.045, size=total_samples)
-    return signal
+    hr_samples: list[float] = []
+    ibi_samples: list[dict[str, float]] = []
+    for beat_time, interval in zip(beat_times, beat_intervals):
+        next_beat_time = beat_time + interval
+        if next_beat_time > duration_seconds:
+            continue
+        ibi_samples.append({"offset": next_beat_time, "interval": interval})
+        hr_samples.append(60.0 / interval)
+    return signal, hr_samples, ibi_samples
 
 
 def generate_scenario_windows(
@@ -201,7 +225,7 @@ def generate_scenario_windows(
             bvp_amp = 95.0
 
         # Synthesize 30 seconds of multi-rate E4 signals
-        bvp_30s = synthesize_ppg_bvp(
+        bvp_30s, hr_30s, ibi_30s = _synthesize_ppg_bvp_with_ibi(
             rng=rng,
             duration_seconds=30,
             target_hr_bpm=hr_target,
@@ -287,6 +311,8 @@ def generate_scenario_windows(
             "BVP": bvp_30s.tolist(),
             "EDA": eda_30s.tolist(),
             "TEMP": temp_30s.tolist(),
+            "HR": hr_30s,
+            "IBI": ibi_30s,
         }
         vitals = summarize_window_vitals(
             window_samples=window_samples,
@@ -306,12 +332,9 @@ def generate_scenario_windows(
             baseline_hr = 0.75 * baseline_hr + 0.25 * float(vitals["hr_bpm"])
             baseline_eda = 0.75 * baseline_eda + 0.25 * float(vitals["eda_mean_us"])
 
-        # During vigorous physical activity, prevent false psychological STRESS classification
-        effective_prediction = (
-            "NON_STRESS"
-            if vitals["activity_state"] == "HIGH_ACTIVITY"
-            else ("STRESS" if stress_prob >= 0.5 else "NON_STRESS")
-        )
+        # Match live Edge behavior: movement is context, not a rule that
+        # relabels exercise as Non-Stress.
+        effective_prediction = "STRESS" if stress_prob >= 0.5 else "NON_STRESS"
 
         prediction_rows.append(
             {
@@ -322,7 +345,14 @@ def generate_scenario_windows(
                 "model_score_stress": round(stress_prob, 4),
                 "model_file": model_file,
                 "model_version": model_version,
-                "sample_counts": {"ACC": n_acc, "BVP": len(bvp_30s), "EDA": n_eda, "TEMP": n_temp},
+                "sample_counts": {
+                    "ACC": n_acc,
+                    "BVP": len(bvp_30s),
+                    "EDA": n_eda,
+                    "HR": len(hr_30s),
+                    "IBI": len(ibi_30s),
+                    "TEMP": n_temp,
+                },
                 "vitals": vitals,
             }
         )

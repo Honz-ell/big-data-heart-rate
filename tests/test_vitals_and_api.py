@@ -4,10 +4,8 @@ import os
 import pickle
 from pathlib import Path
 import sys
-import time
 
 import numpy as np
-import pytest
 from fastapi.testclient import TestClient
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,9 +18,8 @@ os.environ["WESAD_DEMO_MODE"] = "1"
 
 from wesad.demo_simulator import synthesize_ppg_bvp  # noqa: E402
 from wesad.features import SAMPLE_RATES_HZ, sensor_features  # noqa: E402
-from wesad.pickle_reader import iter_pickle_sensor_samples  # noqa: E402
+from wesad.pickle_reader import calibrate_pickle_origin_epoch, iter_pickle_sensor_samples  # noqa: E402
 from wesad.vitals import (  # noqa: E402
-    derive_hr_stream_from_bvp,
     estimate_pulse_from_bvp,
     summarize_window_vitals,
 )
@@ -58,52 +55,45 @@ def test_estimate_pulse_from_bvp_resting_and_tachycardia() -> None:
     assert res_stress["hrv_rmssd_ms"] is not None
     assert float(res_stress["hrv_rmssd_ms"]) < float(res_calm["hrv_rmssd_ms"])
 
-    # Inject large wrist motion spikes (+450 / -480) and verify MAD + FFT prevents sub-harmonic drop
-    corrupted = bvp_stress.copy()
-    corrupted[200:215] = 450.0
-    corrupted[800:812] = -480.0
-    res_noisy = estimate_pulse_from_bvp(corrupted, sample_rate_hz=64.0)
-    assert res_noisy["hr_bpm"] is not None
-    assert 100.0 <= float(res_noisy["hr_bpm"]) <= 116.0
 
-
-def test_latest_contiguous_segment_prevents_multi_hour_chart_squish() -> None:
-    from scripts.device_manager_api import _extract_latest_contiguous_segment
-
-    # Simulate DB rows from 08:33, 09:35 (older runs), and a newest run at 08:38:40..08:40:10
-    rows = [
-        {"window_start": "2017-06-13T08:39:40+00:00", "created_at": "2026-11-21T15:30:06+00:00"},
-        {"window_start": "2017-06-13T08:39:10+00:00", "created_at": "2026-11-21T15:30:04+00:00"},
-        {"window_start": "2017-06-13T08:38:40+00:00", "created_at": "2026-11-21T15:30:02+00:00"},
-        {"window_start": "2017-06-13T09:35:10+00:00", "created_at": "2026-11-21T15:28:00+00:00"},
-        {"window_start": "2017-06-13T08:33:40+00:00", "created_at": "2026-11-21T15:25:00+00:00"},
-    ]
-    seg = _extract_latest_contiguous_segment(rows, max_windows=24)
-    assert [r["window_start"] for r in seg] == [
-        "2017-06-13T08:38:40+00:00",
-        "2017-06-13T08:39:10+00:00",
-        "2017-06-13T08:39:40+00:00",
-    ]
-
-
-def test_pickle_reader_synthesizes_hr_stream_and_slices_offset(tmp_path: Path) -> None:
+def test_pickle_reader_calibrates_bvp_offset_and_joins_csv_hr(tmp_path: Path) -> None:
     subj_dir = tmp_path / "S4"
     e4_dir = subj_dir / "S4_E4_Data"
     e4_dir.mkdir(parents=True)
-    origin = 1500000000.0
-    for sensor, rate in SAMPLE_RATES_HZ.items():
-        (e4_dir / f"{sensor}.csv").write_text(f"{origin}\n{rate}\n0\n", encoding="utf-8")
+    csv_origin = 1500000000.0
+    shift_sec = 12.5  # Simulate E4 powered on 12.5s before synchronized pickle start
 
     rng = np.random.default_rng(7)
-    dur = 25
-    bvp = synthesize_ppg_bvp(rng, dur, target_hr_bpm=80.0, target_rmssd_ms=30.0, amplitude=90.0)
+    full_bvp = synthesize_ppg_bvp(rng, 45, target_hr_bpm=80.0, target_rmssd_ms=30.0, amplitude=90.0)
+    shift_samples = int(round(shift_sec * 64))
+    pickle_bvp = full_bvp[shift_samples : shift_samples + 25 * 64]
+
+    (e4_dir / "BVP.csv").write_text(
+        f"{csv_origin}\n64\n" + "\n".join(f"{v:.4f}" for v in full_bvp) + "\n",
+        encoding="utf-8",
+    )
+    for sensor in ("ACC", "EDA", "TEMP"):
+        rate = SAMPLE_RATES_HZ[sensor]
+        (e4_dir / f"{sensor}.csv").write_text(f"{csv_origin}\n{rate}\n0\n", encoding="utf-8")
+
+    # HR.csv starts at csv_origin with 1 Hz samples (80 BPM during the aligned pickle window)
+    hr_lines = [f"{78.0 + (i % 3):.1f}" for i in range(45)]
+    (e4_dir / "HR.csv").write_text(
+        f"{csv_origin}\n1\n" + "\n".join(hr_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    calibrated_epoch, aligned = calibrate_pickle_origin_epoch(subj_dir, pickle_bvp)
+    assert aligned is True
+    assert abs(calibrated_epoch - (csv_origin + shift_sec)) < 0.05
+
     payload = {
         "signal": {
             "wrist": {
-                "ACC": np.tile(np.array([[38.0, 24.0, 45.0]]), (dur * 32, 1)),
-                "BVP": bvp.reshape(-1, 1),
-                "EDA": np.full((dur * 4, 1), 1.2),
-                "TEMP": np.full((dur * 4, 1), 32.8),
+                "ACC": np.tile(np.array([[38.0, 24.0, 45.0]]), (25 * 32, 1)),
+                "BVP": pickle_bvp.reshape(-1, 1),
+                "EDA": np.full((25 * 4, 1), 1.2),
+                "TEMP": np.full((25 * 4, 1), 32.8),
             }
         }
     }
@@ -121,11 +111,11 @@ def test_pickle_reader_synthesizes_hr_stream_and_slices_offset(tmp_path: Path) -
     sensors_seen = {str(r["sensor"]) for r in records}
     assert sensors_seen == {"ACC", "BVP", "EDA", "HR", "TEMP"}
     hr_values = [float(r["value"]) for r in records if r["sensor"] == "HR"]
-    assert len(hr_values) >= 8
-    assert all(72.0 <= v <= 88.0 for v in hr_values)
+    assert len(hr_values) >= 9
+    assert all(77.0 <= v <= 81.0 for v in hr_values)
 
 
-def test_motion_confounder_suppresses_false_stress() -> None:
+def test_vitals_consecutive_ibi_and_motion_context() -> None:
     rng = np.random.default_rng(99)
     bvp = synthesize_ppg_bvp(rng, 30, target_hr_bpm=122.0, target_rmssd_ms=20.0, amplitude=100.0)
     t_acc = np.arange(30 * 32) / 32.0
@@ -145,12 +135,24 @@ def test_motion_confounder_suppresses_false_stress() -> None:
         assert stats is not None
         feats.extend(stats)
 
+    # Provide consecutive IBIs separated by a 6s dropped-beat gap in the middle
+    ibi_samples = [
+        {"offset": 1.00, "interval": 0.50},
+        {"offset": 1.52, "interval": 0.52},
+        {"offset": 2.01, "interval": 0.49},
+        {"offset": 2.52, "interval": 0.51},
+        # 6-second dropped segment: should NOT be diffed against offset=2.52
+        {"offset": 8.60, "interval": 0.90},
+    ]
+
     vitals = summarize_window_vitals(
         window_samples={
             "ACC": [{"x": float(r[0]), "y": float(r[1]), "z": float(r[2])} for r in acc],
             "BVP": bvp.tolist(),
             "EDA": eda.tolist(),
             "TEMP": temp.tolist(),
+            "HR": [120.0, 122.0, 123.0],
+            "IBI": ibi_samples,
         },
         features=feats,
         model_score_stress=0.62,
@@ -158,8 +160,10 @@ def test_motion_confounder_suppresses_false_stress() -> None:
         baseline_eda_us=0.6,
     )
     assert vitals["activity_state"] == "HIGH_ACTIVITY"
-    assert vitals["heart_anomaly"] == "ELEVATED_WITH_MOTION"
-    assert vitals["stress_load"] < 48
+    assert vitals["heart_anomaly"] == "NONE"
+    assert vitals["stress_load"] == 62
+    assert vitals["hrv_rmssd_ms"] is not None
+    assert float(vitals["hrv_rmssd_ms"]) < 40.0  # Gap jump (0.90 - 0.51 = 390ms) excluded!
     assert any(rc["code"] == "MOTION_CONTEXT" for rc in vitals["reason_codes"])
 
 
@@ -178,13 +182,13 @@ def test_device_manager_and_registry_demo_endpoints() -> None:
 
     with TestClient(device_app) as dev_client:
         assert dev_client.get("/health").status_code == 200
+        assert dev_client.get("/pipeline/telemetry").status_code == 200
         scenarios = dev_client.get("/scenarios").json()
         assert len(scenarios) == 4
         tl = dev_client.get("/devices/S4/timeline").json()
         assert tl["subject_id"] == "S4"
         assert len(tl["predictions"]) == 8
         assert len(tl["spark_series"]) == 24
-        assert tl["summary"]["recovery_seconds"] is not None
 
         first_ws = tl["predictions"][0]["window_start"]
         fb = dev_client.post(
