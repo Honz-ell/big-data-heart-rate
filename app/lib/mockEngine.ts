@@ -578,10 +578,91 @@ export function generateMockPersonalState(options: {
   };
 }
 
-export function buildTeamOverviewData(activePersonal?: PersonalDashboardData | null): TeamOverviewData {
+export interface RawTeamSubjectSummary {
+  subject_id: string;
+  is_streaming: boolean;
+  latest_window_end: string;
+  prediction: string;
+  stress_index: number;
+  hr_bpm: number | null;
+  eda_us: number | null;
+  activity_state: string;
+  sparkline: number[];
+  windows_count: number;
+}
+
+export interface RawTeamSummaryPayload {
+  mode?: string;
+  measured_subjects_count?: number;
+  total_stress_windows?: number;
+  subjects?: Record<string, RawTeamSubjectSummary>;
+}
+
+export function buildTeamOverviewData(
+  activePersonal?: PersonalDashboardData | null,
+  realTeam?: RawTeamSummaryPayload | null
+): TeamOverviewData {
   const hours = ["08:00", "09:00", "10:00", "11:00", "13:00", "14:00", "15:00", "16:00", "17:00"];
+  const realMap = realTeam?.subjects ?? {};
 
   const members: TeamMemberSummary[] = WESAD_SUBJECTS.map((subj, idx) => {
+    const dbEntry = realMap[subj.id];
+
+    // 1. Currently selected subject in Tab 1 if it has real windows
+    if (
+      activePersonal &&
+      activePersonal.subjectId === subj.id &&
+      activePersonal.edgeWindows.length > 0 &&
+      !activePersonal.usingMockFallback
+    ) {
+      const tailScores = activePersonal.edgeWindows.slice(-8).map((w) => w.displayStressIndex);
+      const isRunning =
+        activePersonal.streamState === "running" || activePersonal.streamState === "starting";
+      return {
+        subjectId: subj.id,
+        anonymousCode: subj.anonCode,
+        departmentRole: subj.role,
+        zone: activePersonal.currentZone,
+        motionActive: activePersonal.motionShieldActive,
+        stressIndex: activePersonal.currentScore,
+        hrBpm: Math.round(activePersonal.vitals.hrBpm ?? subj.baselineHr),
+        edaUs: +(activePersonal.vitals.edaUs ?? subj.baselineEda).toFixed(2),
+        sparkline: tailScores.length >= 2 ? tailScores : [activePersonal.currentScore, activePersonal.currentScore],
+        updatedLabel: isRunning ? "⚡ Đang phát Kafka" : "● Dữ liệu DB thật",
+        sourceType: isRunning ? "live_kafka" : "postgres_db",
+        windowsCount: dbEntry?.windows_count ?? activePersonal.edgeWindows.length,
+      };
+    }
+
+    // 2. Any other subject (S2..S17) that has real predictions stored in PostgreSQL!
+    if (dbEntry) {
+      const motion =
+        dbEntry.activity_state === "HIGH_ACTIVITY" && (dbEntry.eda_us === null || dbEntry.eda_us < 2.1);
+      const effScore = motion ? Math.min(35, dbEntry.stress_index) : dbEntry.stress_index;
+      const zone: ZoneState = motion ? "RELAXED" : scoreToZone(effScore);
+      const spk =
+        dbEntry.sparkline && dbEntry.sparkline.length >= 2
+          ? dbEntry.sparkline
+          : [effScore, effScore];
+      return {
+        subjectId: subj.id,
+        anonymousCode: subj.anonCode,
+        departmentRole: subj.role,
+        zone,
+        motionActive: motion,
+        stressIndex: effScore,
+        hrBpm: Math.round(dbEntry.hr_bpm ?? subj.baselineHr),
+        edaUs: +(dbEntry.eda_us ?? subj.baselineEda).toFixed(2),
+        sparkline: spk,
+        updatedLabel: dbEntry.is_streaming
+          ? "⚡ Đang phát Kafka"
+          : `● DB thật (${dbEntry.windows_count} cửa sổ)`,
+        sourceType: dbEntry.is_streaming ? "live_kafka" : "postgres_db",
+        windowsCount: dbEntry.windows_count,
+      };
+    }
+
+    // 3. Fallback when in pure Mock mode for selected subject
     if (activePersonal && activePersonal.subjectId === subj.id) {
       const tailScores = activePersonal.edgeWindows.slice(-8).map((w) => w.displayStressIndex);
       return {
@@ -594,11 +675,12 @@ export function buildTeamOverviewData(activePersonal?: PersonalDashboardData | n
         hrBpm: Math.round(activePersonal.vitals.hrBpm ?? subj.baselineHr),
         edaUs: +(activePersonal.vitals.edaUs ?? subj.baselineEda).toFixed(2),
         sparkline: tailScores.length >= 3 ? tailScores : [24, 28, activePersonal.currentScore],
-        updatedLabel: "Đang phát trực tiếp",
+        updatedLabel: "Mô phỏng trực tiếp",
+        sourceType: "simulated",
       };
     }
 
-    // Deterministic realistic distribution across cohort: ~3 stressed, ~3 attention, ~9 calm
+    // 4. Deterministic simulated cohort member (for subjects not yet replayed into PostgreSQL)
     const baseProfiles = [78, 31, 66, 28, 49, 24, 72, 33, 21, 52, 29, 44, 26, 35, 63];
     const score = baseProfiles[idx % baseProfiles.length];
     const motion = idx === 4; // NV-06 walking patrol
@@ -618,18 +700,29 @@ export function buildTeamOverviewData(activePersonal?: PersonalDashboardData | n
       hrBpm: motion ? subj.baselineHr + 32 : subj.baselineHr + Math.round((effScore - 25) * 0.36),
       edaUs: +(subj.baselineEda + (effScore > 55 ? 1.55 : 0.12)).toFixed(2),
       sparkline,
-      updatedLabel: "Cập nhật 10s trước",
+      updatedLabel: "Mô phỏng ca trực",
+      sourceType: "simulated",
     };
   });
 
+  const realMembers = members.filter(
+    (m) => m.sourceType === "live_kafka" || m.sourceType === "postgres_db"
+  );
+  const realStressedCount = realMembers.filter((m) => m.zone === "STRESS").length;
+  const stressedCount = members.filter((m) => m.zone === "STRESS").length;
+
   const heatmap: HeatmapRow[] = WESAD_SUBJECTS.slice(0, 10).map((subj, rIdx) => {
+    const dbEntry = realMap[subj.id];
     const hourlyScores = hours.map((hour, hIdx) => {
-      // Morning peak around 10:00 (hIdx=2) and afternoon peak around 15:00 (hIdx=6)
       const rushBoost = hIdx === 2 ? 28 : hIdx === 6 ? 25 : hIdx === 3 ? 16 : 0;
-      const raw = Math.round(
-        24 + rushBoost + (rIdx % 3 === 0 ? 18 : 4) + deterministicNoise(rIdx * 31 + hIdx) * 16
-      );
-      const clamped = Math.max(12, Math.min(94, raw));
+      // Anchor 10:00 slot to real PostgreSQL score if available for this subject!
+      const raw =
+        dbEntry && hIdx === 2
+          ? dbEntry.stress_index
+          : Math.round(
+              24 + rushBoost + (rIdx % 3 === 0 ? 18 : 4) + deterministicNoise(rIdx * 31 + hIdx) * 16
+            );
+      const clamped = Math.max(12, Math.min(96, raw));
       return {
         hour,
         score: clamped,
@@ -644,12 +737,15 @@ export function buildTeamOverviewData(activePersonal?: PersonalDashboardData | n
     };
   });
 
-  const stressedCount = members.filter((m) => m.zone === "STRESS").length;
-
   return {
     stressedRatioPercent: Math.round((stressedCount / members.length) * 100),
-    alertsToday: 14 + stressedCount,
+    alertsToday: realTeam?.total_stress_windows
+      ? Math.max(1, Math.floor(realTeam.total_stress_windows / 2))
+      : 14 + stressedCount,
     avgRecoveryMinutes: 3.5,
+    realMeasuredCount: realMembers.length,
+    realStressedCount,
+    realStressWindowsTotal: realTeam?.total_stress_windows ?? 0,
     members,
     heatmap,
     topPeakHours: [

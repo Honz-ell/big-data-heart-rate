@@ -7,6 +7,7 @@ import {
   DEMO_SCENARIOS,
   fmtClockShort,
   generateMockPersonalState,
+  RawTeamSummaryPayload,
   scoreToZone,
   WESAD_SUBJECTS,
 } from "./mockEngine";
@@ -181,7 +182,7 @@ export async function fetchDashboardBundle(params: {
   }
 
   try {
-    const [timeline, devices, rawModels, telemetry] = await Promise.all([
+    const [timeline, devices, rawModels, telemetry, teamSummary] = await Promise.all([
       fetchJsonWithTimeout<RawTimelineResponse>(
         `${DEVICE_API}/devices/${encodeURIComponent(params.subjectId)}/timeline?limit=30`
       ),
@@ -195,6 +196,7 @@ export async function fetchDashboardBundle(params: {
         total_predictions?: number;
         total_spark_windows?: number;
       }>(`${DEVICE_API}/pipeline/telemetry`).catch(() => null),
+      fetchJsonWithTimeout<RawTeamSummaryPayload>(`${DEVICE_API}/team/summary`).catch(() => null),
     ]);
 
     const mappedModels: ModelVersionInfo[] =
@@ -473,7 +475,7 @@ export async function fetchDashboardBundle(params: {
 
       return {
         personal: emptyPersonal,
-        team: buildTeamOverviewData(null),
+        team: buildTeamOverviewData(null, teamSummary),
         system: buildSystemTelemetry({
           isStreaming: streamState === "running" || streamState === "starting",
           speed: subjSession?.speed ?? params.speed,
@@ -564,7 +566,7 @@ export async function fetchDashboardBundle(params: {
 
     return {
       personal,
-      team: buildTeamOverviewData(personal),
+      team: buildTeamOverviewData(personal, teamSummary),
       system: buildSystemTelemetry({
         isStreaming: streamState === "running" || streamState === "starting",
         speed: subjSession?.speed ?? params.speed,

@@ -1294,3 +1294,149 @@ def pipeline_telemetry() -> dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
+
+@app.get("/team/summary")
+def team_summary() -> dict[str, Any]:
+    """Return latest real prediction & vitals summary across all WESAD subjects (S2..S17)."""
+    with sessions_lock:
+        active_map = {
+            sid: public_session(sid, sess) for sid, sess in sessions.items()
+        }
+
+    if DEMO_MODE:
+        subjects_out: dict[str, Any] = {}
+        total_stress_win = 0
+        with sessions_lock:
+            for sid, rows in demo_predictions.items():
+                if not rows:
+                    continue
+                tail = rows[-8:]
+                latest = tail[-1]
+                vit = latest.get("vitals") or {}
+                scores = [
+                    int(
+                        (r.get("vitals") or {}).get("stress_load")
+                        if (r.get("vitals") or {}).get("stress_load") is not None
+                        else round(float(r.get("model_score_stress") or 0) * 100)
+                    )
+                    for r in tail
+                ]
+                total_stress_win += sum(1 for r in rows if r.get("prediction") == "STRESS")
+                sess_info = active_map.get(sid, {})
+                is_streaming = sess_info.get("producer_status") in {"running", "starting"}
+                subjects_out[sid] = {
+                    "subject_id": sid,
+                    "is_streaming": is_streaming,
+                    "latest_window_end": _iso_utc(latest["window_end"]),
+                    "prediction": latest["prediction"],
+                    "stress_index": scores[-1],
+                    "hr_bpm": vit.get("hr_bpm"),
+                    "eda_us": vit.get("eda_mean_us"),
+                    "activity_state": vit.get("activity_state") or "RESTING",
+                    "sparkline": scores,
+                    "windows_count": len(rows),
+                }
+        return {
+            "mode": "demo_replay",
+            "measured_subjects_count": len(subjects_out),
+            "total_stress_windows": total_stress_win,
+            "subjects": subjects_out,
+        }
+
+    subjects_out = {}
+    total_stress_win = 0
+    try:
+        with db_connect() as connection:
+            ranked_rows = connection.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        subject_id,
+                        window_start,
+                        window_end,
+                        prediction,
+                        model_score_stress,
+                        vitals,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY subject_id ORDER BY window_start DESC
+                        ) AS rn,
+                        COUNT(*) OVER (PARTITION BY subject_id) AS total_cnt
+                    FROM stress_predictions
+                )
+                SELECT subject_id, window_start, window_end, prediction,
+                       model_score_stress, vitals, total_cnt
+                FROM ranked
+                WHERE rn <= 8
+                ORDER BY subject_id, window_start ASC
+                """
+            ).fetchall()
+
+            spark_latest_rows = connection.execute(
+                """
+                SELECT DISTINCT ON (subject_id, sensor)
+                    subject_id, sensor, mean_value
+                FROM sensor_window_aggregates
+                WHERE sensor IN ('HR', 'EDA')
+                ORDER BY subject_id, sensor, window_start_utc DESC
+                """
+            ).fetchall()
+
+            cnt_row = connection.execute(
+                "SELECT COUNT(*) AS cnt FROM stress_predictions WHERE prediction = 'STRESS'"
+            ).fetchone()
+            total_stress_win = int((cnt_row or {}).get("cnt") or 0)
+    except psycopg.Error as error:
+        raise HTTPException(status_code=503, detail="Could not query team summary") from error
+
+    spark_fallback: dict[tuple[str, str], float] = {}
+    for srow in spark_latest_rows:
+        spark_fallback[(str(srow["subject_id"]), str(srow["sensor"]).upper())] = float(
+            srow["mean_value"]
+        )
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in ranked_rows:
+        grouped.setdefault(str(row["subject_id"]), []).append(row)
+
+    for sid, tail in grouped.items():
+        latest = tail[-1]
+        vit = latest.get("vitals") if isinstance(latest.get("vitals"), dict) else {}
+        scores = [
+            int(
+                (r.get("vitals") or {}).get("stress_load")
+                if isinstance(r.get("vitals"), dict)
+                and r["vitals"].get("stress_load") is not None
+                else round(float(r.get("model_score_stress") or 0) * 100)
+            )
+            for r in tail
+        ]
+        hr_val = vit.get("hr_bpm")
+        if hr_val is None and (sid, "HR") in spark_fallback:
+            hr_val = round(spark_fallback[(sid, "HR")], 1)
+        eda_val = vit.get("eda_mean_us")
+        if eda_val is None and (sid, "EDA") in spark_fallback:
+            eda_val = round(spark_fallback[(sid, "EDA")], 2)
+
+        sess_info = active_map.get(sid, {})
+        is_streaming = sess_info.get("producer_status") in {"running", "starting"}
+        subjects_out[sid] = {
+            "subject_id": sid,
+            "is_streaming": is_streaming,
+            "latest_window_end": _iso_utc(latest["window_end"]),
+            "prediction": str(latest["prediction"]),
+            "stress_index": scores[-1],
+            "hr_bpm": round(float(hr_val), 1) if hr_val is not None else None,
+            "eda_us": round(float(eda_val), 2) if eda_val is not None else None,
+            "activity_state": str(vit.get("activity_state") or "RESTING"),
+            "sparkline": scores,
+            "windows_count": int(latest.get("total_cnt") or len(tail)),
+        }
+
+    return {
+        "mode": "live_stack",
+        "measured_subjects_count": len(subjects_out),
+        "total_stress_windows": total_stress_win,
+        "subjects": subjects_out,
+    }
+
+

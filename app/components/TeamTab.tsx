@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import { Line, LineChart, ResponsiveContainer } from "recharts";
 import { TeamOverviewData, ZoneState } from "../lib/types";
 import { InfoTooltip } from "./InfoTooltip";
@@ -47,9 +47,22 @@ export function TeamTab({
   selectedSubjectId: string;
   onInspectMember: (subjectId: string) => void;
 }) {
+  const realCount = data.realMeasuredCount ?? 0;
+  // Default to strict real-PostgreSQL mode whenever at least 1 subject has real DB rows
+  const [showSimulatedFill, setShowSimulatedFill] = useState<boolean>(false);
+  const strictRealOnly = realCount > 0 && !showSimulatedFill;
+
+  const displayedStressedRatio = strictRealOnly
+    ? Math.round(((data.realStressedCount ?? 0) / Math.max(1, realCount)) * 100)
+    : data.stressedRatioPercent;
+  const displayedDenominator = strictRealOnly ? realCount : data.members.length;
+  const displayedStressedCount = strictRealOnly
+    ? data.realStressedCount ?? 0
+    : Math.round((data.stressedRatioPercent * data.members.length) / 100);
+
   return (
     <div className="space-y-5">
-      {/* Privacy Notice Banner */}
+      {/* Privacy Notice Banner + DB Mode Switcher */}
       <div
         className="surface-card flex flex-wrap items-center justify-between gap-3 px-5 py-3.5"
         style={{ borderLeft: "4px solid var(--emerald)" }}
@@ -61,16 +74,53 @@ export function TeamTab({
           <div>
             <strong style={{ color: "var(--ink)" }}>Chính sách Quyền riêng tư &amp; Ẩn danh hóa:</strong>{" "}
             <span style={{ color: "var(--muted)" }}>
-              Mọi thành viên được mã hóa ẩn danh (NV-02..NV-17), chỉ hiển thị mức tổng hợp phục vụ sắp xếp ca trực / nghỉ giải lao cho nhân viên văn phòng, tài xế và điều dưỡng.
+              Mọi thành viên được mã hóa ẩn danh (NV-02..NV-17 = S2..S17), lấy dữ liệu trực tiếp từ bảng{" "}
+              <code>stress_predictions</code> trong PostgreSQL của từng thiết bị đã phát.
             </span>
           </div>
         </div>
-        <span
-          className="rounded-full px-3 py-1 text-xs font-bold"
-          style={{ backgroundColor: "var(--surface-2)", color: "var(--ink-2)", border: "1px solid var(--border)" }}
-        >
-          15 thiết bị đang kết nối
-        </span>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {realCount > 0 ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowSimulatedFill(false)}
+                className="rounded-full px-3 py-1 text-xs font-extrabold cursor-pointer transition-all"
+                style={{
+                  backgroundColor: !showSimulatedFill ? "var(--emerald)" : "var(--surface-2)",
+                  color: !showSimulatedFill ? "#ffffff" : "var(--ink-2)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                ● Chỉ dữ liệu thật PostgreSQL ({realCount}/15 đã đo)
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSimulatedFill(true)}
+                className="rounded-full px-3 py-1 text-xs font-bold cursor-pointer transition-all"
+                style={{
+                  backgroundColor: showSimulatedFill ? "var(--sky)" : "var(--surface-2)",
+                  color: showSimulatedFill ? "#ffffff" : "var(--muted)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                👁 Kèm mô phỏng đủ 15 ca trực
+              </button>
+            </>
+          ) : (
+            <span
+              className="rounded-full px-3 py-1 text-xs font-bold"
+              style={{
+                backgroundColor: "var(--surface-2)",
+                color: "var(--ink-2)",
+                border: "1px solid var(--border)",
+              }}
+            >
+              Đang hiển thị mô phỏng 15 thiết bị
+            </span>
+          )}
+        </div>
       </div>
 
       {/* 3 Group KPI Cards */}
@@ -82,20 +132,21 @@ export function TeamTab({
             </span>
             <InfoTooltip
               title="% người đang căng thẳng"
-              content="Tỷ lệ thành viên trong ca làm việc có chỉ số căng thẳng ≥ 60/100 ở cửa sổ 30 giây gần nhất (đã loại trừ người đang vận động thể chất)."
+              content="Tỷ lệ thành viên có chỉ số căng thẳng ≥ 60/100 ở cửa sổ 30 giây gần nhất trong PostgreSQL (đã loại trừ người đang vận động thể chất)."
             />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span
               className="text-4xl font-black tabular-nums"
               style={{
-                color: data.stressedRatioPercent >= 30 ? "var(--crimson)" : "var(--emerald)",
+                color: displayedStressedRatio >= 30 ? "var(--crimson)" : "var(--emerald)",
               }}
             >
-              {data.stressedRatioPercent}%
+              {displayedStressedRatio}%
             </span>
             <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
-              ({Math.round((data.stressedRatioPercent * data.members.length) / 100)}/{data.members.length} thành viên)
+              ({displayedStressedCount}/{displayedDenominator}{" "}
+              {strictRealOnly ? "thiết bị đã đo thật" : "thành viên"})
             </span>
           </div>
           <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
@@ -106,19 +157,19 @@ export function TeamTab({
         <div className="surface-card p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold uppercase tracking-wider" style={{ color: "var(--muted)" }}>
-              Số cảnh báo sớm hôm nay
+              Số cảnh báo ghi nhận trong DB
             </span>
             <InfoTooltip
-              title="Tổng số cảnh báo trong ca"
-              content="Số đợt căng thẳng kéo dài ≥ 2 cửa sổ liên tiếp (1 phút) được phát hiện trên toàn bộ nhóm ẩn danh trong ngày."
+              title="Tổng số cảnh báo"
+              content="Tính trực tiếp từ tổng số cửa sổ dự đoán STRESS đã lưu trong bảng stress_predictions của PostgreSQL."
             />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-4xl font-black tabular-nums" style={{ color: "var(--amber)" }}>
-              {data.alertsToday}
+              {strictRealOnly ? Math.max(0, Math.ceil((data.realStressWindowsTotal ?? 0) / 2)) : data.alertsToday}
             </span>
             <span className="text-xs font-semibold" style={{ color: "var(--muted)" }}>
-              lượt nhắc nghỉ ngơi
+              đợt cảnh báo ({data.realStressWindowsTotal ?? 0} cửa sổ Stress trong DB)
             </span>
           </div>
           <p className="mt-2 text-xs" style={{ color: "var(--muted)" }}>
@@ -158,10 +209,10 @@ export function TeamTab({
               Trạng thái Trực tiếp theo Thành viên Ẩn danh (S2 – S17)
             </h3>
             <p className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
-              Nhấp vào một thẻ bất kỳ để chuyển sang xem chi tiết luồng cảm biến của thiết bị đó
+              Nhấp vào bất kỳ thẻ nào (ví dụ <strong>NV-09 = S9</strong>) để chuyển sang Tab 1 và phát luồng cảm biến thật từ file <code>.pkl</code> của người đó vào PostgreSQL
             </p>
           </div>
-          <div className="flex items-center gap-3 text-xs font-semibold">
+          <div className="flex flex-wrap items-center gap-3 text-xs font-semibold">
             <span style={{ color: "var(--emerald)" }}>✓ Ổn định</span>
             <span style={{ color: "var(--amber)" }}>⚠ Chú ý</span>
             <span style={{ color: "var(--crimson)" }}>▲ Căng thẳng</span>
@@ -171,8 +222,47 @@ export function TeamTab({
 
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
           {data.members.map((m) => {
-            const b = zoneBadge(m.zone, m.motionActive);
+            const isReal = m.sourceType === "live_kafka" || m.sourceType === "postgres_db";
             const isSelected = m.subjectId === selectedSubjectId;
+
+            if (strictRealOnly && !isReal) {
+              return (
+                <button
+                  key={m.subjectId}
+                  type="button"
+                  onClick={() => onInspectMember(m.subjectId)}
+                  className="surface-subtle p-3.5 text-left cursor-pointer transition-all hover:-translate-y-0.5 opacity-75 hover:opacity-100"
+                  style={{
+                    borderColor: isSelected ? "var(--sky)" : "var(--border)",
+                    borderWidth: isSelected ? "2px" : "1px",
+                    borderStyle: "dashed",
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-sm font-extrabold" style={{ color: "var(--ink)" }}>
+                      {m.anonymousCode}{" "}
+                      <span className="text-[11px] font-normal" style={{ color: "var(--muted)" }}>
+                        ({m.subjectId})
+                      </span>
+                    </span>
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                      style={{ backgroundColor: "var(--surface-3)", color: "var(--muted)" }}
+                    >
+                      ○ Chưa đo
+                    </span>
+                  </div>
+                  <div className="text-[11px] truncate mb-2" style={{ color: "var(--muted)" }}>
+                    {m.departmentRole}
+                  </div>
+                  <div className="py-2 text-xs font-semibold" style={{ color: "var(--sky)" }}>
+                    ▶ Nhấp để phát dữ liệu thật {m.subjectId}.pkl
+                  </div>
+                </button>
+              );
+            }
+
+            const b = zoneBadge(m.zone, m.motionActive);
             return (
               <button
                 key={m.subjectId}
@@ -180,13 +270,16 @@ export function TeamTab({
                 onClick={() => onInspectMember(m.subjectId)}
                 className="surface-subtle p-3.5 text-left cursor-pointer transition-all hover:-translate-y-0.5"
                 style={{
-                  borderColor: isSelected ? "var(--sky)" : "var(--border)",
+                  borderColor: isSelected ? "var(--sky)" : isReal ? "var(--emerald)" : "var(--border)",
                   borderWidth: isSelected ? "2px" : "1px",
                 }}
               >
                 <div className="flex items-center justify-between gap-1 mb-1">
                   <span className="text-sm font-extrabold" style={{ color: "var(--ink)" }}>
-                    {m.anonymousCode}
+                    {m.anonymousCode}{" "}
+                    <span className="text-[11px] font-normal" style={{ color: "var(--muted)" }}>
+                      ({m.subjectId})
+                    </span>
                   </span>
                   <span
                     className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-bold"
@@ -197,7 +290,7 @@ export function TeamTab({
                   </span>
                 </div>
 
-                <div className="text-[11px] truncate mb-2" style={{ color: "var(--muted)" }}>
+                <div className="text-[11px] truncate mb-1.5" style={{ color: "var(--muted)" }}>
                   {m.departmentRole}
                 </div>
 
@@ -228,6 +321,21 @@ export function TeamTab({
                       />
                     </LineChart>
                   </ResponsiveContainer>
+                </div>
+
+                <div className="mt-1 flex items-center justify-between text-[10.5px] font-bold">
+                  <span
+                    style={{
+                      color:
+                        m.sourceType === "live_kafka"
+                          ? "var(--sky)"
+                          : isReal
+                            ? "var(--emerald)"
+                            : "var(--muted)",
+                    }}
+                  >
+                    {m.updatedLabel}
+                  </span>
                 </div>
               </button>
             );
@@ -272,7 +380,7 @@ export function TeamTab({
                   <td className="py-2 pr-3 font-bold whitespace-nowrap" style={{ color: "var(--ink)" }}>
                     {row.anonymousCode}
                     <span className="ml-1.5 font-normal text-[11px] hidden sm:inline" style={{ color: "var(--muted)" }}>
-                      ({row.role.split(" ")[0]} {row.role.split(" ")[1] ?? ""})
+                      ({row.subjectId})
                     </span>
                   </td>
                   {row.hourlyScores.map((cell) => {

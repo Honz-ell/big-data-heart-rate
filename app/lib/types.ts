@@ -132,6 +132,8 @@ export interface TeamMemberSummary {
   edaUs: number;
   sparkline: number[];
   updatedLabel: string;
+  sourceType?: "live_kafka" | "postgres_db" | "simulated";
+  windowsCount?: number;
 }
 
 export interface HeatmapRow {
@@ -145,6 +147,9 @@ export interface TeamOverviewData {
   stressedRatioPercent: number;
   alertsToday: number;
   avgRecoveryMinutes: number;
+  realMeasuredCount?: number;
+  realStressedCount?: number;
+  realStressWindowsTotal?: number;
   members: TeamMemberSummary[];
   heatmap: HeatmapRow[];
   topPeakHours: {

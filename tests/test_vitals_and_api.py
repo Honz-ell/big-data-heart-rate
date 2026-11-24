@@ -183,6 +183,9 @@ def test_device_manager_and_registry_demo_endpoints() -> None:
     with TestClient(device_app) as dev_client:
         assert dev_client.get("/health").status_code == 200
         assert dev_client.get("/pipeline/telemetry").status_code == 200
+        team_res = dev_client.get("/team/summary")
+        assert team_res.status_code == 200
+        assert "S4" in team_res.json()["subjects"]
         scenarios = dev_client.get("/scenarios").json()
         assert len(scenarios) == 4
         tl = dev_client.get("/devices/S4/timeline").json()
