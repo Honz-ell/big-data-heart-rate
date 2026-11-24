@@ -260,3 +260,24 @@ def test_resolve_subject_scenario_offsets_for_counterbalanced_subject(tmp_path) 
     assert 120 <= offsets["physical_activity_check"] <= 150
     assert offsets["stress_to_recovery"] == 210
 
+    import joblib
+    from wesad.cohort_runner import (
+        build_subject_scenario_records,
+        load_or_build_subject_catalog,
+    )
+
+    catalog = load_or_build_subject_catalog(subj_dir, cache_dir=tmp_path / "cache")
+    assert catalog is not None
+    assert len(catalog["windows"]) == 12
+    rf_bundle = joblib.load("models/v1.0.0.joblib")
+    s_rows, p_rows = build_subject_scenario_records(
+        catalog=catalog,
+        scenario_id="tsst_acute_stress",
+        model=rf_bundle["model"],
+        model_file="v1.0.0.joblib",
+        model_version="v1.0.0",
+    )
+    assert len(p_rows) == 4
+    assert len(s_rows) >= 48
+
+

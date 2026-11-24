@@ -595,6 +595,14 @@ export interface RawTeamSummaryPayload {
   mode?: string;
   measured_subjects_count?: number;
   total_stress_windows?: number;
+  cohort_job?: {
+    status?: "idle" | "running" | "completed" | "failed";
+    scenario_id?: string | null;
+    completed_count?: number;
+    total_count?: number;
+    current_subject?: string | null;
+    error?: string | null;
+  };
   subjects?: Record<string, RawTeamSubjectSummary>;
 }
 
@@ -746,6 +754,16 @@ export function buildTeamOverviewData(
     realMeasuredCount: realMembers.length,
     realStressedCount,
     realStressWindowsTotal: realTeam?.total_stress_windows ?? 0,
+    cohortJob: realTeam?.cohort_job
+      ? {
+          status: realTeam.cohort_job.status ?? "idle",
+          scenarioId: realTeam.cohort_job.scenario_id ?? null,
+          completedCount: realTeam.cohort_job.completed_count ?? 0,
+          totalCount: realTeam.cohort_job.total_count ?? 15,
+          currentSubject: realTeam.cohort_job.current_subject ?? null,
+          error: realTeam.cohort_job.error ?? null,
+        }
+      : undefined,
     members,
     heatmap,
     topPeakHours: [

@@ -2,7 +2,8 @@
 
 import React, { useState } from "react";
 import { Line, LineChart, ResponsiveContainer } from "recharts";
-import { TeamOverviewData, ZoneState } from "../lib/types";
+import { DEMO_SCENARIOS } from "../lib/mockEngine";
+import { ScenarioId, TeamOverviewData, ZoneState } from "../lib/types";
 import { InfoTooltip } from "./InfoTooltip";
 
 function zoneBadge(zone: ZoneState, motionActive: boolean) {
@@ -41,16 +42,25 @@ function zoneBadge(zone: ZoneState, motionActive: boolean) {
 export function TeamTab({
   data,
   selectedSubjectId,
+  scenarioId,
   onInspectMember,
+  onRunCohortScenario,
 }: {
   data: TeamOverviewData;
   selectedSubjectId: string;
+  scenarioId: ScenarioId;
   onInspectMember: (subjectId: string) => void;
+  onRunCohortScenario: (scenarioId: ScenarioId) => void;
 }) {
   const realCount = data.realMeasuredCount ?? 0;
   // Default to strict real-PostgreSQL mode whenever at least 1 subject has real DB rows
   const [showSimulatedFill, setShowSimulatedFill] = useState<boolean>(false);
   const strictRealOnly = realCount > 0 && !showSimulatedFill;
+  const activeScenarioTitle =
+    DEMO_SCENARIOS.find((s) => s.id === scenarioId)?.title ?? "Áp lực thuyết trình (TSST)";
+  const cohortRunning = data.cohortJob?.status === "running";
+  const cohortDone = data.cohortJob?.completedCount ?? 0;
+  const cohortTotal = data.cohortJob?.totalCount ?? 15;
 
   const displayedStressedRatio = strictRealOnly
     ? Math.round(((data.realStressedCount ?? 0) / Math.max(1, realCount)) * 100)
@@ -62,65 +72,95 @@ export function TeamTab({
 
   return (
     <div className="space-y-5">
-      {/* Privacy Notice Banner + DB Mode Switcher */}
+      {/* Privacy Notice Banner + DB Mode Switcher + 15-Subject Cohort Runner */}
       <div
-        className="surface-card flex flex-wrap items-center justify-between gap-3 px-5 py-3.5"
+        className="surface-card space-y-3 px-5 py-4"
         style={{ borderLeft: "4px solid var(--emerald)" }}
       >
-        <div className="flex items-center gap-2.5 text-sm">
-          <span className="text-lg" aria-hidden="true">
-            🔒
-          </span>
-          <div>
-            <strong style={{ color: "var(--ink)" }}>Chính sách Quyền riêng tư &amp; Ẩn danh hóa:</strong>{" "}
-            <span style={{ color: "var(--muted)" }}>
-              Mọi thành viên được mã hóa ẩn danh (NV-02..NV-17 = S2..S17), lấy dữ liệu trực tiếp từ bảng{" "}
-              <code>stress_predictions</code> trong PostgreSQL của từng thiết bị đã phát.
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 text-sm">
+            <span className="text-lg" aria-hidden="true">
+              🔒
             </span>
+            <div>
+              <strong style={{ color: "var(--ink)" }}>Chính sách Quyền riêng tư &amp; Chạy Toàn Nhóm (S2–S17):</strong>{" "}
+              <span style={{ color: "var(--muted)" }}>
+                Khi đang ở Tab 2, chọn bất kỳ kịch bản nào phía trên sẽ <strong>chạy cuốn chiếu lần lượt cả 15 file <code>.pkl</code> thật</strong> (chỉ tốn ~1 GB RAM) và cập nhật thẳng vào PostgreSQL!
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={cohortRunning}
+              onClick={() => onRunCohortScenario(scenarioId)}
+              className="rounded-xl px-3.5 py-1.5 text-xs font-extrabold cursor-pointer transition-opacity disabled:opacity-60"
+              style={{
+                backgroundColor: "var(--sky)",
+                color: "#ffffff",
+              }}
+            >
+              {cohortRunning
+                ? `⚡ Đang xử lý ${data.cohortJob?.currentSubject ?? ""} (${cohortDone}/${cohortTotal})...`
+                : `⚡ Chạy "${activeScenarioTitle}" cho cả 15 người`}
+            </button>
+
+            {realCount > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowSimulatedFill(false)}
+                  className="rounded-full px-3 py-1 text-xs font-extrabold cursor-pointer transition-all"
+                  style={{
+                    backgroundColor: !showSimulatedFill ? "var(--emerald)" : "var(--surface-2)",
+                    color: !showSimulatedFill ? "#ffffff" : "var(--ink-2)",
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  ● DB thật ({realCount}/15)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowSimulatedFill(true)}
+                  className="rounded-full px-3 py-1 text-xs font-bold cursor-pointer transition-all"
+                  style={{
+                    backgroundColor: showSimulatedFill ? "var(--amber)" : "var(--surface-2)",
+                    color: showSimulatedFill ? "#ffffff" : "var(--muted)",
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  👁 Kèm mô phỏng
+                </button>
+              </>
+            )}
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {realCount > 0 ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setShowSimulatedFill(false)}
-                className="rounded-full px-3 py-1 text-xs font-extrabold cursor-pointer transition-all"
+        {/* Live Sequential Cohort Progress Bar */}
+        {cohortRunning && (
+          <div className="space-y-1.5 pt-1">
+            <div className="flex items-center justify-between text-xs font-bold" style={{ color: "var(--sky)" }}>
+              <span>
+                ⚡ Đang trích xuất tín hiệu thật &amp; chấm điểm Random Forest cho thiết bị{" "}
+                <strong>{data.cohortJob?.currentSubject}</strong>...
+              </span>
+              <span className="tabular-nums">
+                {cohortDone}/{cohortTotal} thành viên ({Math.round((cohortDone / cohortTotal) * 100)}%)
+              </span>
+            </div>
+            <div className="h-2.5 w-full rounded-full overflow-hidden" style={{ backgroundColor: "var(--surface-3)" }}>
+              <div
+                className="h-full rounded-full"
                 style={{
-                  backgroundColor: !showSimulatedFill ? "var(--emerald)" : "var(--surface-2)",
-                  color: !showSimulatedFill ? "#ffffff" : "var(--ink-2)",
-                  border: "1px solid var(--border)",
+                  width: `${Math.max(5, Math.round((cohortDone / cohortTotal) * 100))}%`,
+                  backgroundColor: "var(--sky)",
+                  transition: "width 250ms ease",
                 }}
-              >
-                ● Chỉ dữ liệu thật PostgreSQL ({realCount}/15 đã đo)
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowSimulatedFill(true)}
-                className="rounded-full px-3 py-1 text-xs font-bold cursor-pointer transition-all"
-                style={{
-                  backgroundColor: showSimulatedFill ? "var(--sky)" : "var(--surface-2)",
-                  color: showSimulatedFill ? "#ffffff" : "var(--muted)",
-                  border: "1px solid var(--border)",
-                }}
-              >
-                👁 Kèm mô phỏng đủ 15 ca trực
-              </button>
-            </>
-          ) : (
-            <span
-              className="rounded-full px-3 py-1 text-xs font-bold"
-              style={{
-                backgroundColor: "var(--surface-2)",
-                color: "var(--ink-2)",
-                border: "1px solid var(--border)",
-              }}
-            >
-              Đang hiển thị mô phỏng 15 thiết bị
-            </span>
-          )}
-        </div>
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 3 Group KPI Cards */}

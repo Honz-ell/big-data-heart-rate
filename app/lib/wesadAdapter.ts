@@ -645,6 +645,27 @@ export async function startScenarioOnApi(params: {
   }
 }
 
+export async function startCohortScenarioOnApi(params: {
+  scenarioId: ScenarioId;
+  forceMockMode: boolean;
+}): Promise<{ usedApi: boolean; error?: string }> {
+  if (params.forceMockMode) return { usedApi: false };
+  try {
+    await fetchJsonWithTimeout(`${DEVICE_API}/team/run-scenario`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scenario_id: params.scenarioId }),
+    });
+    return { usedApi: true };
+  } catch (err) {
+    return {
+      usedApi: false,
+      error:
+        err instanceof Error ? err.message : "Không thể chạy kịch bản toàn nhóm trên API",
+    };
+  }
+}
+
 export async function stopStreamOnApi(subjectId: string, forceMockMode: boolean): Promise<void> {
   if (forceMockMode) return;
   try {

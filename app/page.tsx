@@ -13,6 +13,7 @@ import {
   activateModelVersion,
   AdapterFetchBundle,
   fetchDashboardBundle,
+  startCohortScenarioOnApi,
   startScenarioOnApi,
   stopStreamOnApi,
   submitUserFeedback,
@@ -124,16 +125,19 @@ export default function HomePage() {
     ]
   );
 
-  // Refresh every 3 seconds as specified in design principles
+  const cohortRunning = bundle?.team.cohortJob?.status === "running";
+
+  // Refresh every 3s normally, or every 1.1s while 15-subject cohort batch is actively running
   useEffect(() => {
     void loadBundle();
+    const intervalMs = cohortRunning ? 1100 : 3000;
     const timer = window.setInterval(() => {
       if (pausedLocally) return;
       setTickSeed((t) => t + 1);
       setMockVisibleWindows((w) => (mockStreamState === "running" ? Math.min(12, w + 1) : w));
-    }, 3000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [loadBundle, pausedLocally, mockStreamState]);
+  }, [loadBundle, pausedLocally, mockStreamState, cohortRunning]);
 
   // Countdown indicator when reconnecting
   useEffect(() => {
@@ -147,6 +151,19 @@ export default function HomePage() {
     return () => window.clearInterval(id);
   }, [bundle, forceMockMode]);
 
+  const handleRunCohortScenario = async (targetScenario: ScenarioId) => {
+    setActionError(null);
+    setScenarioId(targetScenario);
+    const res = await startCohortScenarioOnApi({
+      scenarioId: targetScenario,
+      forceMockMode,
+    });
+    if (!forceMockMode && !res.usedApi && res.error) {
+      setActionError(res.error);
+    }
+    void loadBundle(tickSeed + 1, { force: true, scenarioId: targetScenario });
+  };
+
   const handleLaunchScenario = async (nextScenario: ScenarioId) => {
     const spec = DEMO_SCENARIOS.find((s) => s.id === nextScenario) ?? DEMO_SCENARIOS[0];
     setActionError(null);
@@ -155,6 +172,35 @@ export default function HomePage() {
     setPausedLocally(false);
     setMockStreamState("running");
     setMockVisibleWindows(5);
+
+    // Auto-mark demo walkthrough steps
+    setChecklist((prev) => ({
+      ...prev,
+      ranBaseline: prev.ranBaseline || nextScenario === "baseline_calm",
+      ranStressAndAlert:
+        prev.ranStressAndAlert ||
+        nextScenario === "tsst_acute_stress" ||
+        nextScenario === "stress_to_recovery",
+      ranMotionShield: prev.ranMotionShield || nextScenario === "physical_activity_check",
+    }));
+
+    // When user is viewing Tab 2 ("Theo dõi nhóm"), run the chosen scenario sequentially across ALL 15 subjects!
+    if (activeTab === "team") {
+      const cohortRes = await startCohortScenarioOnApi({
+        scenarioId: nextScenario,
+        forceMockMode,
+      });
+      if (!forceMockMode && !cohortRes.usedApi && cohortRes.error) {
+        setActionError(cohortRes.error);
+      }
+      void loadBundle(tickSeed + 1, {
+        force: true,
+        subjectId,
+        scenarioId: nextScenario,
+        speed: spec.default_speed,
+      });
+      return;
+    }
 
     // Clear stale previous-session chart immediately on live stack so user sees active loading state
     if (!forceMockMode && bundle?.apiConnected) {
@@ -173,17 +219,6 @@ export default function HomePage() {
           : prev
       );
     }
-
-    // Auto-mark demo walkthrough steps
-    setChecklist((prev) => ({
-      ...prev,
-      ranBaseline: prev.ranBaseline || nextScenario === "baseline_calm",
-      ranStressAndAlert:
-        prev.ranStressAndAlert ||
-        nextScenario === "tsst_acute_stress" ||
-        nextScenario === "stress_to_recovery",
-      ranMotionShield: prev.ranMotionShield || nextScenario === "physical_activity_check",
-    }));
 
     const startRes = await startScenarioOnApi({
       subjectId,
@@ -207,6 +242,10 @@ export default function HomePage() {
     setPausedLocally(false);
     setMockStreamState("running");
     setMockVisibleWindows((w) => (w < 4 ? 5 : w));
+    if (activeTab === "team") {
+      await handleRunCohortScenario(scenarioId);
+      return;
+    }
     if (!forceMockMode && bundle?.apiConnected) {
       setBundle((prev) =>
         prev
@@ -394,7 +433,9 @@ export default function HomePage() {
               <TeamTab
                 data={bundle.team}
                 selectedSubjectId={subjectId}
+                scenarioId={scenarioId}
                 onInspectMember={handleInspectTeamMember}
+                onRunCohortScenario={(id) => void handleRunCohortScenario(id)}
               />
             )}
 

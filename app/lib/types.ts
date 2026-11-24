@@ -143,6 +143,15 @@ export interface HeatmapRow {
   hourlyScores: { hour: string; score: number; zone: ZoneState }[];
 }
 
+export interface CohortJobState {
+  status: "idle" | "running" | "completed" | "failed";
+  scenarioId: string | null;
+  completedCount: number;
+  totalCount: number;
+  currentSubject: string | null;
+  error: string | null;
+}
+
 export interface TeamOverviewData {
   stressedRatioPercent: number;
   alertsToday: number;
@@ -150,6 +159,7 @@ export interface TeamOverviewData {
   realMeasuredCount?: number;
   realStressedCount?: number;
   realStressWindowsTotal?: number;
+  cohortJob?: CohortJobState;
   members: TeamMemberSummary[];
   heatmap: HeatmapRow[];
   topPeakHours: {

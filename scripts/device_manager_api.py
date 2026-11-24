@@ -13,6 +13,7 @@ import uuid
 
 import joblib
 import psycopg
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from wesad.cohort_runner import (  # noqa: E402
+    build_subject_scenario_records,
+    load_or_build_subject_catalog,
+)
 from wesad.demo_simulator import SCENARIO_CATALOG, generate_scenario_windows  # noqa: E402
 from wesad.pickle_reader import (  # noqa: E402
     pickle_wrist_origin_epoch,
@@ -59,8 +64,21 @@ class FeedbackRequest(BaseModel):
     note: str = Field(default="", max_length=240)
 
 
+class CohortScenarioRequest(BaseModel):
+    scenario_id: str = Field(default="tsst_acute_stress")
+
+
 sessions: dict[str, dict[str, Any]] = {}
 sessions_lock = threading.RLock()
+_cohort_state: dict[str, Any] = {
+    "run_id": "",
+    "status": "idle",
+    "scenario_id": None,
+    "completed_count": 0,
+    "total_count": len(DEMO_SUBJECTS),
+    "current_subject": None,
+    "error": None,
+}
 
 # Demo / sandbox in-memory stores (used when WESAD_DEMO_MODE=1 or explicit demo replay)
 demo_predictions: dict[str, list[dict[str, Any]]] = {}
@@ -1020,31 +1038,55 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
             else:
                 pred_rows = connection.execute(
                     """
+                    WITH latest_run AS (
+                        SELECT MAX(created_at) AS max_ts
+                        FROM stress_predictions
+                        WHERE subject_id = %s
+                    )
                     SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
                            p.model_score_stress, p.model_file, p.model_version,
                            p.sample_counts, p.vitals,
                            f.verdict AS feedback_verdict, f.note AS feedback_note
                     FROM stress_predictions p
+                    CROSS JOIN latest_run lr
                     LEFT JOIN prediction_feedback f
                       ON f.subject_id = p.subject_id AND f.window_start = p.window_start
                     WHERE p.subject_id = %s
+                      AND (lr.max_ts IS NULL OR p.created_at >= lr.max_ts - INTERVAL '90 seconds')
                     ORDER BY p.window_start DESC
                     LIMIT %s
                     """,
-                    (subject_id, limit),
+                    (subject_id, subject_id, limit),
                 ).fetchall()
 
-                spark_raw = connection.execute(
-                    """
-                    SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
-                           sample_count, mean_value, min_value, max_value, spark_batch_id
-                    FROM sensor_window_aggregates
-                    WHERE subject_id = %s
-                    ORDER BY window_start_utc DESC
-                    LIMIT %s
-                    """,
-                    (subject_id, limit * 18),
-                ).fetchall()
+                if pred_rows:
+                    min_ws = min(r["window_start"] for r in pred_rows)
+                    max_we = max(r["window_end"] for r in pred_rows)
+                    spark_raw = connection.execute(
+                        """
+                        SELECT DISTINCT ON (window_start_utc, sensor)
+                               subject_id, window_start_utc, window_end_utc, sensor, unit,
+                               sample_count, mean_value, min_value, max_value, spark_batch_id
+                        FROM sensor_window_aggregates
+                        WHERE subject_id = %s
+                          AND window_start_utc >= %s AND window_end_utc <= %s
+                        ORDER BY window_start_utc DESC, sensor, ingested_at DESC
+                        LIMIT %s
+                        """,
+                        (subject_id, min_ws, max_we, limit * 18),
+                    ).fetchall()
+                else:
+                    spark_raw = connection.execute(
+                        """
+                        SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
+                               sample_count, mean_value, min_value, max_value, spark_batch_id
+                        FROM sensor_window_aggregates
+                        WHERE subject_id = %s
+                        ORDER BY window_start_utc DESC
+                        LIMIT %s
+                        """,
+                        (subject_id, limit * 18),
+                    ).fetchall()
     except psycopg.Error as error:
         raise HTTPException(
             status_code=503,
@@ -1340,6 +1382,7 @@ def team_summary() -> dict[str, Any]:
             "mode": "demo_replay",
             "measured_subjects_count": len(subjects_out),
             "total_stress_windows": total_stress_win,
+            "cohort_job": dict(_cohort_state),
             "subjects": subjects_out,
         }
 
@@ -1349,19 +1392,29 @@ def team_summary() -> dict[str, Any]:
         with db_connect() as connection:
             ranked_rows = connection.execute(
                 """
-                WITH ranked AS (
-                    SELECT
-                        subject_id,
-                        window_start,
-                        window_end,
-                        prediction,
-                        model_score_stress,
-                        vitals,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY subject_id ORDER BY window_start DESC
-                        ) AS rn,
-                        COUNT(*) OVER (PARTITION BY subject_id) AS total_cnt
+                WITH latest_batch AS (
+                    SELECT subject_id,
+                           MAX(created_at) AS max_created_at,
+                           COUNT(*) AS total_cnt
                     FROM stress_predictions
+                    GROUP BY subject_id
+                ),
+                ranked AS (
+                    SELECT
+                        p.subject_id,
+                        p.window_start,
+                        p.window_end,
+                        p.prediction,
+                        p.model_score_stress,
+                        p.vitals,
+                        lb.total_cnt,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY p.subject_id ORDER BY p.window_start DESC
+                        ) AS rn
+                    FROM stress_predictions p
+                    JOIN latest_batch lb
+                      ON lb.subject_id = p.subject_id
+                     AND p.created_at >= lb.max_created_at - INTERVAL '90 seconds'
                 )
                 SELECT subject_id, window_start, window_end, prediction,
                        model_score_stress, vitals, total_cnt
@@ -1377,7 +1430,7 @@ def team_summary() -> dict[str, Any]:
                     subject_id, sensor, mean_value
                 FROM sensor_window_aggregates
                 WHERE sensor IN ('HR', 'EDA')
-                ORDER BY subject_id, sensor, window_start_utc DESC
+                ORDER BY subject_id, sensor, ingested_at DESC, window_start_utc DESC
                 """
             ).fetchall()
 
@@ -1436,7 +1489,153 @@ def team_summary() -> dict[str, Any]:
         "mode": "live_stack",
         "measured_subjects_count": len(subjects_out),
         "total_stress_windows": total_stress_win,
+        "cohort_job": dict(_cohort_state),
         "subjects": subjects_out,
     }
+
+
+@app.post("/team/run-scenario")
+def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
+    """Sequentially process a scenario across all 15 WESAD subjects (S2..S17) with low memory."""
+    scenario_id = _infer_scenario_id(3690, request.scenario_id)
+    run_id = uuid.uuid4().hex[:8]
+    with sessions_lock:
+        _cohort_state.update(
+            {
+                "run_id": run_id,
+                "status": "running",
+                "scenario_id": scenario_id,
+                "completed_count": 0,
+                "total_count": len(DEMO_SUBJECTS),
+                "current_subject": DEMO_SUBJECTS[0],
+                "error": None,
+            }
+        )
+
+    def _cohort_worker() -> None:
+        try:
+            model, model_file, model_version = _load_local_rf()
+            cache_dir = RUNTIME_DIR / "cohort_cache"
+
+            for idx, sid in enumerate(DEMO_SUBJECTS):
+                with sessions_lock:
+                    if _cohort_state.get("run_id") != run_id:
+                        return
+                    _cohort_state["current_subject"] = sid
+
+                subj_dir = DATA_ROOT / sid
+                has_pkl = (subj_dir / f"{sid}.pkl").is_file()
+
+                if DEMO_MODE or not has_pkl:
+                    s_rows, p_rows = generate_scenario_windows(
+                        scenario_id=scenario_id,
+                        subject_id=sid,
+                        model=model,
+                        model_file=model_file,
+                        model_version=model_version,
+                        duration_seconds=180 if scenario_id == "stress_to_recovery" else 120,
+                    )
+                    if DEMO_MODE:
+                        with sessions_lock:
+                            demo_spark_rows[sid] = s_rows
+                            demo_predictions[sid] = p_rows
+                        time.sleep(0.08)
+                else:
+                    t0 = time.monotonic()
+                    catalog = load_or_build_subject_catalog(subj_dir, cache_dir=cache_dir)
+                    if catalog is None:
+                        continue
+                    s_rows, p_rows = build_subject_scenario_records(
+                        catalog=catalog,
+                        scenario_id=scenario_id,
+                        model=model,
+                        model_file=model_file,
+                        model_version=model_version,
+                        spark_batch_base=800 + idx * 20,
+                    )
+                    # If cached in RAM (< 30ms), add tiny 90ms pacing so UI cards ripple smoothly
+                    if time.monotonic() - t0 < 0.05:
+                        time.sleep(0.09)
+
+                if not DEMO_MODE and p_rows:
+                    with db_connect() as connection:
+                        for pr in p_rows:
+                            connection.execute(
+                                """
+                                INSERT INTO stress_predictions (
+                                    subject_id, window_start, window_end, prediction,
+                                    model_score_stress, model_file, model_version, sample_counts, vitals
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (subject_id, window_start) DO UPDATE SET
+                                    window_end = EXCLUDED.window_end,
+                                    prediction = EXCLUDED.prediction,
+                                    model_score_stress = EXCLUDED.model_score_stress,
+                                    model_file = EXCLUDED.model_file,
+                                    model_version = EXCLUDED.model_version,
+                                    sample_counts = EXCLUDED.sample_counts,
+                                    vitals = EXCLUDED.vitals,
+                                    created_at = NOW()
+                                """,
+                                (
+                                    pr["subject_id"],
+                                    pr["window_start"],
+                                    pr["window_end"],
+                                    pr["prediction"],
+                                    pr["model_score_stress"],
+                                    pr["model_file"],
+                                    pr["model_version"],
+                                    Jsonb(pr["sample_counts"]),
+                                    Jsonb(pr["vitals"]),
+                                ),
+                            )
+                        for sr in s_rows:
+                            connection.execute(
+                                """
+                                INSERT INTO sensor_window_aggregates (
+                                    subject_id, window_start_utc, window_end_utc,
+                                    sensor, unit, sample_count,
+                                    mean_value, min_value, max_value, spark_batch_id
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (
+                                    sr["subject_id"],
+                                    sr["window_start_utc"],
+                                    sr["window_end_utc"],
+                                    sr["sensor"],
+                                    sr["unit"],
+                                    sr["sample_count"],
+                                    sr["mean_value"],
+                                    sr["min_value"],
+                                    sr["max_value"],
+                                    sr["spark_batch_id"],
+                                ),
+                            )
+                        connection.commit()
+
+                    # Clear stopped single-device replay bounds so clicking this card on Tab 2 shows the new batch on Tab 1
+                    with sessions_lock:
+                        old_sess = sessions.get(sid)
+                        if old_sess and not old_sess.get("launching"):
+                            if process_state(old_sess.get("producer")) != "running":
+                                sessions.pop(sid, None)
+
+                with sessions_lock:
+                    if _cohort_state.get("run_id") != run_id:
+                        return
+                    _cohort_state["completed_count"] = idx + 1
+
+            with sessions_lock:
+                if _cohort_state.get("run_id") == run_id:
+                    _cohort_state["status"] = "completed"
+                    _cohort_state["current_subject"] = None
+        except Exception as err:
+            with sessions_lock:
+                if _cohort_state.get("run_id") == run_id:
+                    _cohort_state["status"] = "failed"
+                    _cohort_state["error"] = str(err)
+
+    threading.Thread(target=_cohort_worker, daemon=True).start()
+    return dict(_cohort_state)
+
 
 
