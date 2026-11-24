@@ -71,9 +71,9 @@ export const WESAD_SUBJECTS: {
   baselineHr: number;
   baselineEda: number;
 }[] = [
-  { id: "S4", anonCode: "NV-04", role: "Sinh viên CNTT (Kiểm thử độc lập)", baselineHr: 64, baselineEda: 0.42 },
   { id: "S2", anonCode: "NV-02", role: "Nhân viên văn phòng", baselineHr: 68, baselineEda: 0.55 },
   { id: "S3", anonCode: "NV-03", role: "Điều dưỡng ca trực", baselineHr: 72, baselineEda: 0.61 },
+  { id: "S4", anonCode: "NV-04", role: "Sinh viên CNTT (Kiểm thử độc lập)", baselineHr: 64, baselineEda: 0.42 },
   { id: "S5", anonCode: "NV-05", role: "Tài xế vận tải", baselineHr: 66, baselineEda: 0.48 },
   { id: "S6", anonCode: "NV-06", role: "Kỹ sư vận hành trực ca", baselineHr: 70, baselineEda: 0.52 },
   { id: "S7", anonCode: "NV-07", role: "Chuyên viên chăm sóc KH", baselineHr: 74, baselineEda: 0.64 },
@@ -719,18 +719,24 @@ export function buildTeamOverviewData(
   const realStressedCount = realMembers.filter((m) => m.zone === "STRESS").length;
   const stressedCount = members.filter((m) => m.zone === "STRESS").length;
 
-  const heatmap: HeatmapRow[] = WESAD_SUBJECTS.slice(0, 10).map((subj, rIdx) => {
+  const heatmap: HeatmapRow[] = WESAD_SUBJECTS.map((subj, rIdx) => {
+    const memberObj = members[rIdx];
     const dbEntry = realMap[subj.id];
     const hourlyScores = hours.map((hour, hIdx) => {
       const rushBoost = hIdx === 2 ? 28 : hIdx === 6 ? 25 : hIdx === 3 ? 16 : 0;
-      // Anchor 10:00 slot to real PostgreSQL score if available for this subject!
-      const raw =
-        dbEntry && hIdx === 2
-          ? dbEntry.stress_index
-          : Math.round(
-              24 + rushBoost + (rIdx % 3 === 0 ? 18 : 4) + deterministicNoise(rIdx * 31 + hIdx) * 16
-            );
-      const clamped = Math.max(12, Math.min(96, raw));
+      let raw: number;
+      if (dbEntry && hIdx === 2) {
+        // 10:00 reflects exact real PostgreSQL latest stress score of this subject
+        raw = memberObj.stressIndex;
+      } else if (dbEntry && dbEntry.sparkline.length > 0 && hIdx === 3) {
+        // 11:00 reflects earliest window in the subject's real DB batch
+        raw = dbEntry.sparkline[0];
+      } else {
+        raw = Math.round(
+          24 + rushBoost + (rIdx % 3 === 0 ? 18 : 4) + deterministicNoise(rIdx * 31 + hIdx) * 16
+        );
+      }
+      const clamped = Math.max(0, Math.min(100, raw));
       return {
         hour,
         score: clamped,
