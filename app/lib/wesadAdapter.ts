@@ -205,31 +205,37 @@ export async function fetchDashboardBundle(params: {
         ? rawModels.map((rm) => {
             const losoRecall = rm.metrics?.loso_mean_metrics?.stress_recall;
             const losoF1 = rm.metrics?.loso_mean_metrics?.stress_f1;
+            const s4Recall = rm.metrics?.heldout_metrics?.S4?.stress_recall ?? null;
             const s4F1 = rm.metrics?.heldout_metrics?.S4?.stress_f1 ?? null;
+            const realRecall =
+              losoRecall !== undefined
+                ? +(losoRecall * 100).toFixed(1)
+                : s4Recall !== null
+                  ? +(s4Recall * 100).toFixed(1)
+                  : null;
+            const realF1 =
+              s4F1 !== null
+                ? +(s4F1 * 100).toFixed(1)
+                : losoF1 !== undefined
+                  ? +(losoF1 * 100).toFixed(1)
+                  : null;
+            const noteParts: string[] = [];
+            if (s4F1 !== null) noteParts.push(`Kiểm thử độc lập S4 F1 ${(s4F1 * 100).toFixed(1)}%`);
+            if (losoF1 !== undefined) noteParts.push(`LOSO F1 ${(losoF1 * 100).toFixed(1)}%`);
             return {
               version: rm.version,
               modelFile: rm.model_file,
               sha256Short: rm.sha256.slice(0, 12),
               sha256Full: rm.sha256,
-              stressRecall:
-                losoRecall !== undefined
-                  ? +(losoRecall * 100).toFixed(1)
-                  : rm.version === "v1.1.0"
-                    ? 68.5
-                    : 60.0,
-              stressF1:
-                s4F1 !== null
-                  ? +(s4F1 * 100).toFixed(1)
-                  : losoF1 !== undefined
-                    ? +(losoF1 * 100).toFixed(1)
-                    : 56.9,
+              stressRecall: realRecall,
+              stressF1: realF1,
               heldoutS4F1: s4F1 !== null ? +(s4F1 * 100).toFixed(1) : null,
-              releasedAt: rm.created_at ? rm.created_at.slice(0, 16).replace("T", " ") + " UTC" : "2026-11-21",
+              releasedAt: rm.created_at ? rm.created_at.slice(0, 16).replace("T", " ") + " UTC" : "—",
               isActive: rm.is_active,
               notes:
-                s4F1 !== null
-                  ? `Kiểm thử độc lập S4 F1 ${(s4F1 * 100).toFixed(1)}% · LOSO F1 ${((losoF1 ?? 0.569) * 100).toFixed(1)}%`
-                  : `Đánh giá chéo 14 người đeo LOSO F1 ${((losoF1 ?? 0.569) * 100).toFixed(1)}%`,
+                noteParts.length > 0
+                  ? noteParts.join(" · ")
+                  : "Chưa đính kèm metadata đánh giá trong Registry",
             };
           })
         : DEFAULT_MODELS;
@@ -390,7 +396,9 @@ export async function fetchDashboardBundle(params: {
         displayStressIndex: displayScore,
         zone,
         motionShieldActive: motionShield,
-        confidencePercent: Math.round(74 + Math.abs(rawRf - 0.5) * 48),
+        confidencePercent: Math.round(
+          (row.prediction === "STRESS" ? rawRf : 1 - rawRf) * 100
+        ),
         modelVersion: row.model_version ?? activeModelVersion,
         hr_bpm: hr,
         baseline_hr_bpm: baseHr,

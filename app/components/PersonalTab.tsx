@@ -369,10 +369,11 @@ export function PersonalTab({
               </span>
 
               <span
+                title="Tỷ lệ phiếu bầu trực tiếp từ mô hình Random Forest (predict_proba) cho nhãn hiện tại"
                 className="inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold"
                 style={{ backgroundColor: "var(--surface-2)", color: "var(--ink-2)", border: "1px solid var(--border)" }}
               >
-                Độ tin cậy phân loại: <strong className="tabular-nums">{data.confidencePercent}%</strong>
+                Xác suất lớp dự đoán (RF): <strong className="tabular-nums">{data.confidencePercent}%</strong>
               </span>
 
               <span

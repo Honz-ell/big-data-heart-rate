@@ -161,6 +161,15 @@ export function TeamTab({
             </div>
           </div>
         )}
+        {data.cohortJob?.skippedSubjects && data.cohortJob.skippedSubjects.length > 0 && (
+          <div
+            className="rounded-xl px-3.5 py-2 text-xs font-semibold"
+            style={{ backgroundColor: "var(--amber-soft)", color: "var(--amber)" }}
+          >
+            ⚠ Đã bỏ qua {data.cohortJob.skippedSubjects.length} thiết bị do thiếu tệp <code>.pkl</code> thật:{" "}
+            <strong>{data.cohortJob.skippedSubjects.join(", ")}</strong>
+          </div>
+        )}
         {data.cohortJob?.status === "failed" && data.cohortJob.error && (
           <div
             className="rounded-xl px-3.5 py-2 text-xs font-bold"

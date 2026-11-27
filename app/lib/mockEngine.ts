@@ -503,7 +503,9 @@ export function generateMockPersonalState(options: {
       displayStressIndex: displayScore,
       zone,
       motionShieldActive: motionShield,
-      confidencePercent: Math.round(74 + Math.abs(rawRf - 0.5) * 48),
+      confidencePercent: Math.round(
+        (prediction === "STRESS" ? rawRf : 1 - rawRf) * 100
+      ),
       modelVersion: options.activeModelVersion,
       hr_bpm: hr,
       baseline_hr_bpm: subj.baselineHr,
@@ -620,6 +622,7 @@ export interface RawTeamSummaryPayload {
     completed_count?: number;
     total_count?: number;
     current_subject?: string | null;
+    skipped_subjects?: string[];
     error?: string | null;
   };
   subjects?: Record<string, RawTeamSubjectSummary>;
@@ -844,6 +847,7 @@ export function buildTeamOverviewData(
           completedCount: realTeam.cohort_job.completed_count ?? 0,
           totalCount: realTeam.cohort_job.total_count ?? 15,
           currentSubject: realTeam.cohort_job.current_subject ?? null,
+          skippedSubjects: realTeam.cohort_job.skipped_subjects ?? [],
           error: realTeam.cohort_job.error ?? null,
         }
       : undefined,

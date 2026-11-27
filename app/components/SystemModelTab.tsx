@@ -466,10 +466,10 @@ export function SystemModelTab({
                     {m.sha256Short}…
                   </td>
                   <td className="py-3 pr-3 font-bold tabular-nums" style={{ color: "var(--ink)" }}>
-                    {m.stressRecall.toFixed(1)}%
+                    {m.stressRecall !== null ? `${m.stressRecall.toFixed(1)}%` : "—"}
                   </td>
                   <td className="py-3 pr-3 font-bold tabular-nums" style={{ color: "var(--ink)" }}>
-                    {m.stressF1.toFixed(1)}%
+                    {m.stressF1 !== null ? `${m.stressF1.toFixed(1)}%` : "—"}
                   </td>
                   <td className="py-3 pr-3 tabular-nums" style={{ color: "var(--muted)" }}>
                     {m.releasedAt}

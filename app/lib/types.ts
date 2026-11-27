@@ -156,6 +156,7 @@ export interface CohortJobState {
   completedCount: number;
   totalCount: number;
   currentSubject: string | null;
+  skippedSubjects?: string[];
   error: string | null;
 }
 
@@ -200,8 +201,8 @@ export interface ModelVersionInfo {
   modelFile: string;
   sha256Short: string;
   sha256Full: string;
-  stressRecall: number;
-  stressF1: number;
+  stressRecall: number | null;
+  stressF1: number | null;
   heldoutS4F1: number | null;
   releasedAt: string;
   isActive: boolean;
