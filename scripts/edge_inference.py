@@ -350,7 +350,7 @@ def main() -> int:
                 refresh_active_model()
                 last_model_check = now
 
-            records = consumer.poll(timeout_ms=1000, max_records=500)
+            records = consumer.poll(timeout_ms=350, max_records=5000)
             if not records:
                 idle_polls += 1
                 if (

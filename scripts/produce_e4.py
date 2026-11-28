@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Internal Spark event-time shift. Omit to reserve a safe range in PostgreSQL.",
     )
+    parser.add_argument(
+        "--pause-file",
+        type=Path,
+        default=None,
+        help="Optional flag file; while this file exists, producer pauses sending records.",
+    )
     return parser.parse_args()
 
 
@@ -159,6 +165,14 @@ def main() -> int:
                         "Không cấp được mốc replay qua PostgreSQL. Hãy bật PostgreSQL "
                         "hoặc truyền --stream-shift-seconds nếu chỉ kiểm tra Kafka."
                     ) from error
+            if args.pause_file is not None and args.pause_file.exists():
+                if producer is not None:
+                    producer.flush(timeout=5)
+                pause_started = time.monotonic()
+                while args.pause_file.exists():
+                    time.sleep(0.15)
+                if playback_started_at is not None:
+                    playback_started_at += time.monotonic() - pause_started
             if playback_origin is None:
                 playback_origin = event_time
                 playback_started_at = time.monotonic()

@@ -2,15 +2,15 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "WESAD Stress Lab — Phân tích dữ liệu cảm biến đeo",
+  title: "WESAD Stress Edge — Dashboard Giám sát Căng thẳng & Big Data Thời gian thực",
   description:
-    "Mô phỏng phát lại dữ liệu WESAD qua Kafka và Spark, phân loại Stress/Non-Stress và trực quan hóa tín hiệu HR, IBI, EDA, nhiệt độ và gia tốc. Không phải công cụ chẩn đoán sức khỏe.",
+    "Nguyên mẫu học tập phát lại dữ liệu cảm biến đồng hồ Empatica E4 (WESAD) qua Kafka, Spark Structured Streaming (10s), PostgreSQL và Edge Random Forest (30s Hot-Swap). Không dùng chẩn đoán y tế.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="vi">
-      <body>{children}</body>
+    <html lang="vi" data-theme="dark" suppressHydrationWarning>
+      <body className="min-h-screen">{children}</body>
     </html>
   );
 }

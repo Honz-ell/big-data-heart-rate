@@ -247,7 +247,7 @@ def main() -> None:
             )
         )
         .option("checkpointLocation", args.checkpoint_location)
-        .trigger(processingTime="5 seconds")
+        .trigger(processingTime="2 seconds")
         .start()
     )
     metrics_server = ThreadingHTTPServer(

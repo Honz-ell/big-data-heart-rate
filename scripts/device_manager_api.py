@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import threading
@@ -13,6 +14,7 @@ import uuid
 
 import joblib
 import psycopg
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,8 +26,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from wesad.cohort_runner import (  # noqa: E402
+    build_subject_scenario_records,
+    load_or_build_subject_catalog,
+)
 from wesad.demo_simulator import SCENARIO_CATALOG, generate_scenario_windows  # noqa: E402
-from wesad.pickle_reader import pickle_wrist_origin_epoch  # noqa: E402
+from wesad.pickle_reader import (  # noqa: E402
+    pickle_wrist_origin_epoch,
+    resolve_subject_scenario_offsets,
+)
 from wesad.replay_clock import ensure_replay_clock  # noqa: E402
 from wesad.vitals import classify_activity  # noqa: E402
 
@@ -33,8 +42,8 @@ DATA_ROOT = Path(os.getenv("WESAD_DATA_ROOT", r"D:\btldll\archive\WESAD"))
 RUNTIME_DIR = PROJECT_ROOT / "scripts" / "runtime"
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "stress_rf_no_s4_eval.joblib"
 FALLBACK_MODEL = PROJECT_ROOT / "models" / "stress_rf.joblib"
-REGISTRY_URL = os.getenv("MODEL_REGISTRY_URL", "http://localhost:8000")
-BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
+REGISTRY_URL = os.getenv("MODEL_REGISTRY_URL", "http://127.0.0.1:8000")
+BROKER = os.getenv("KAFKA_BROKER", "127.0.0.1:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "wearable.sensor.v1")
 DEMO_MODE = os.getenv("WESAD_DEMO_MODE", "").strip().lower() in {"1", "true", "yes"}
 DEMO_SUBJECTS = ["S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S13", "S14", "S15", "S16", "S17"]
@@ -56,8 +65,47 @@ class FeedbackRequest(BaseModel):
     note: str = Field(default="", max_length=240)
 
 
+class CohortScenarioRequest(BaseModel):
+    scenario_id: str = Field(default="tsst_acute_stress")
+
+
+class PauseDeviceRequest(BaseModel):
+    paused: bool = Field(default=True)
+
+
+def _probe_tcp(host_port: str, timeout: float = 0.35) -> bool:
+    """Return True only if a real TCP socket connection succeeds."""
+    target = host_port.split(",")[0].strip()
+    if ":" in target:
+        host, port_str = target.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            return False
+    else:
+        host, port = target, 9092
+    try:
+        with socket.create_connection((host or "127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _pause_flag_path(subject_id: str) -> Path:
+    return RUNTIME_DIR / f"pause_{subject_id}.flag"
+
+
 sessions: dict[str, dict[str, Any]] = {}
 sessions_lock = threading.RLock()
+_cohort_state: dict[str, Any] = {
+    "run_id": "",
+    "status": "idle",
+    "scenario_id": None,
+    "completed_count": 0,
+    "total_count": len(DEMO_SUBJECTS),
+    "current_subject": None,
+    "error": None,
+}
 
 # Demo / sandbox in-memory stores (used when WESAD_DEMO_MODE=1 or explicit demo replay)
 demo_predictions: dict[str, list[dict[str, Any]]] = {}
@@ -67,9 +115,23 @@ _cached_rf_bundle: dict[str, Any] | None = None
 _db_pool: ConnectionPool | None = None
 
 
+def _resolve_default_model_path() -> Path | None:
+    candidates = [
+        DEFAULT_MODEL,
+        PROJECT_ROOT / "models" / "v1.0.0.joblib",
+        PROJECT_ROOT / "models" / "stress_rf_no_s4.joblib",
+        FALLBACK_MODEL,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    any_models = sorted((PROJECT_ROOT / "models").glob("*.joblib"))
+    return any_models[0] if any_models else None
+
+
 def _load_local_rf() -> tuple[Any, str, str | None]:
     global _cached_rf_bundle
-    model_path = DEFAULT_MODEL if DEFAULT_MODEL.is_file() else FALLBACK_MODEL
+    model_path = _resolve_default_model_path() or FALLBACK_MODEL
     if _cached_rf_bundle is None:
         _cached_rf_bundle = joblib.load(model_path)
     active_version: str | None = _cached_rf_bundle.get("model_version") or "v1.0.0"
@@ -122,7 +184,7 @@ def _seed_initial_demo_data() -> None:
 
 def _db_connection_kwargs() -> dict[str, Any]:
     return {
-        "host": os.getenv("DB_HOST", "localhost"),
+        "host": os.getenv("DB_HOST", "127.0.0.1"),
         "port": int(os.getenv("DB_PORT", "5432")),
         "dbname": os.getenv("DB_NAME", "wesad"),
         "user": os.getenv("DB_USER", "wesad"),
@@ -176,7 +238,11 @@ def read_tail(path: Path | None, lines: int = 16) -> list[str]:
 
 
 def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
+    is_paused = bool(session.get("paused", False))
     if session.get("is_demo"):
+        prod_st = session.get("demo_producer_status", "completed")
+        if is_paused and prod_st == "running":
+            prod_st = "paused"
         return {
             "device_id": f"wearable-{subject_id.lower()}",
             "subject_id": subject_id,
@@ -185,7 +251,8 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
             "duration_seconds": session["duration_seconds"],
             "speed": session["speed"],
             "created_at": session["created_at"],
-            "producer_status": session.get("demo_producer_status", "completed"),
+            "paused": is_paused,
+            "producer_status": prod_st,
             "edge_status": session.get("demo_edge_status", "completed"),
             "consumer_group": session["consumer_group"],
             "mode": "demo_replay",
@@ -196,7 +263,12 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
     def current_state(name: str) -> str:
         if session.get(f"{name}_stopped"):
             return "stopped"
-        return process_state(session.get(name))
+        if session.get("launching") and session.get(name) is None:
+            return "starting"
+        st = process_state(session.get(name))
+        if name == "producer" and is_paused and st == "running":
+            return "paused"
+        return st
 
     return {
         "device_id": f"wearable-{subject_id.lower()}",
@@ -206,6 +278,7 @@ def public_session(subject_id: str, session: dict[str, Any]) -> dict[str, Any]:
         "duration_seconds": session["duration_seconds"],
         "speed": session["speed"],
         "created_at": session["created_at"],
+        "paused": is_paused,
         "producer_status": current_state("producer"),
         "edge_status": current_state("edge"),
         "consumer_group": session["consumer_group"],
@@ -376,6 +449,8 @@ def _start_demo_session(request: StartDeviceRequest, scenario_id: str) -> dict[s
         sent_samples = 0
 
         for bucket_idx in range(total_10s_buckets):
+            while session.get("paused") and not session.get("demo_cancelled"):
+                time.sleep(0.15)
             if session.get("demo_cancelled"):
                 session["demo_producer_status"] = "stopped"
                 session["demo_edge_status"] = "stopped"
@@ -436,8 +511,9 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
     with sessions_lock:
         previous = sessions.get(subject_id)
         if previous:
-            prod_running = process_state(previous.get("producer")) == "running"
-            edge_running = process_state(previous.get("edge")) == "running"
+            previous["cancelled"] = True
+            prod_running = process_state(previous.get("producer")) == "running" or previous.get("launching")
+            edge_running = process_state(previous.get("edge")) == "running" or previous.get("launching")
             if prod_running and not request.replace_running:
                 raise HTTPException(status_code=409, detail=f"{subject_id} is already running")
             if prod_running or edge_running:
@@ -445,8 +521,11 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
                 stop_process(previous.get("edge"))
                 previous["producer_stopped"] = True
                 previous["edge_stopped"] = True
+                previous["launching"] = False
 
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        pause_flag = _pause_flag_path(subject_id)
+        pause_flag.unlink(missing_ok=True)
         session_id = uuid.uuid4().hex[:8]
         consumer_group = f"edge-{subject_id.lower()}-{session_id}"
         edge_log = RUNTIME_DIR / f"{subject_id}-{session_id}-edge.log"
@@ -476,49 +555,19 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             "--limit", "0",
             "--broker", BROKER,
             "--topic", TOPIC,
+            "--pause-file", str(pause_flag),
         ]
-        edge_process: subprocess.Popen[bytes] | None = None
         child_env = os.environ.copy()
         child_env["PYTHONUTF8"] = "1"
-        try:
-            with edge_log.open("w", encoding="utf-8") as edge_output:
-                edge_process = subprocess.Popen(
-                    edge_command,
-                    cwd=PROJECT_ROOT,
-                    stdin=subprocess.DEVNULL,
-                    stdout=edge_output,
-                    stderr=subprocess.STDOUT,
-                    env=child_env,
-                )
-
-            ready_deadline = time.monotonic() + 15
-            while time.monotonic() < ready_deadline:
-                if edge_process.poll() is not None:
-                    raise RuntimeError(f"Edge exited early; inspect {edge_log.name}")
-                if "edge simulator" in "\n".join(read_tail(edge_log, 30)).lower():
-                    break
-                time.sleep(0.25)
-            else:
-                raise RuntimeError(f"Edge did not become ready; inspect {edge_log.name}")
-
-            with producer_log.open("w", encoding="utf-8") as producer_output:
-                producer_process = subprocess.Popen(
-                    producer_command,
-                    cwd=PROJECT_ROOT,
-                    stdin=subprocess.DEVNULL,
-                    stdout=producer_output,
-                    stderr=subprocess.STDOUT,
-                    env=child_env,
-                )
-        except (OSError, RuntimeError) as error:
-            stop_process(edge_process)
-            raise HTTPException(status_code=503, detail=str(error)) from error
-
-        session = {
+        session: dict[str, Any] = {
             "is_demo": False,
+            "paused": False,
             "scenario_id": scenario_id,
-            "producer": producer_process,
-            "edge": edge_process,
+            "producer": None,
+            "edge": None,
+            "launching": True,
+            "origin_epoch": None,
+            "cancelled": False,
             "producer_stopped": False,
             "edge_stopped": False,
             "producer_log": producer_log,
@@ -530,15 +579,86 @@ def start_device(request: StartDeviceRequest) -> dict[str, Any]:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         sessions[subject_id] = session
+
+        def _launch_live_workers() -> None:
+            edge_proc: subprocess.Popen[bytes] | None = None
+            prod_proc: subprocess.Popen[bytes] | None = None
+            try:
+                if (subject_dir / f"{subject_id}.pkl").is_file():
+                    try:
+                        computed_origin = pickle_wrist_origin_epoch(subject_dir)
+                        with sessions_lock:
+                            session["origin_epoch"] = computed_origin
+                    except Exception:
+                        pass
+
+                with edge_log.open("w", encoding="utf-8") as edge_output:
+                    edge_proc = subprocess.Popen(
+                        edge_command,
+                        cwd=PROJECT_ROOT,
+                        stdin=subprocess.DEVNULL,
+                        stdout=edge_output,
+                        stderr=subprocess.STDOUT,
+                        env=child_env,
+                    )
+                with sessions_lock:
+                    if session.get("cancelled"):
+                        stop_process(edge_proc)
+                        session["launching"] = False
+                        return
+                    session["edge"] = edge_proc
+
+                ready_deadline = time.monotonic() + 18
+                while time.monotonic() < ready_deadline:
+                    if session.get("cancelled"):
+                        stop_process(edge_proc)
+                        return
+                    if edge_proc.poll() is not None:
+                        raise RuntimeError(f"Edge exited early; inspect {edge_log.name}")
+                    if "edge simulator" in "\n".join(read_tail(edge_log, 30)).lower():
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError(f"Edge did not become ready; inspect {edge_log.name}")
+
+                with producer_log.open("w", encoding="utf-8") as producer_output:
+                    prod_proc = subprocess.Popen(
+                        producer_command,
+                        cwd=PROJECT_ROOT,
+                        stdin=subprocess.DEVNULL,
+                        stdout=producer_output,
+                        stderr=subprocess.STDOUT,
+                        env=child_env,
+                    )
+                with sessions_lock:
+                    if session.get("cancelled"):
+                        stop_process(prod_proc)
+                        stop_process(edge_proc)
+                        return
+                    session["producer"] = prod_proc
+            except (OSError, RuntimeError) as err:
+                stop_process(prod_proc)
+                stop_process(edge_proc)
+                with producer_log.open("a", encoding="utf-8") as handle:
+                    handle.write(f"\n[launch_error] {err}\n")
+            finally:
+                with sessions_lock:
+                    session["launching"] = False
+
+        threading.Thread(target=_launch_live_workers, daemon=True).start()
         return public_session(subject_id, session)
 
 
 @app.post("/devices/{subject_id}/stop")
 def stop_device(subject_id: str) -> dict[str, Any]:
+    _pause_flag_path(subject_id).unlink(missing_ok=True)
     with sessions_lock:
         session = sessions.get(subject_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"No session for {subject_id}")
+        session["cancelled"] = True
+        session["paused"] = False
+        session["launching"] = False
         if session.get("is_demo"):
             session["demo_cancelled"] = True
             session["demo_producer_status"] = "stopped"
@@ -549,6 +669,34 @@ def stop_device(subject_id: str) -> dict[str, Any]:
         session["producer_stopped"] = True
         session["edge_stopped"] = True
         return public_session(subject_id, session)
+
+
+@app.post("/devices/{subject_id}/pause")
+def pause_device(subject_id: str, request: PauseDeviceRequest) -> dict[str, Any]:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    flag = _pause_flag_path(subject_id)
+    with sessions_lock:
+        session = sessions.get(subject_id)
+        if session is None:
+            flag.unlink(missing_ok=True)
+            return {
+                "subject_id": subject_id,
+                "paused": request.paused,
+                "has_active_stream": False,
+            }
+        session["paused"] = request.paused
+        if not session.get("is_demo"):
+            if request.paused:
+                flag.write_text("paused\n", encoding="utf-8")
+            else:
+                flag.unlink(missing_ok=True)
+        pub = public_session(subject_id, session)
+        return {
+            "subject_id": subject_id,
+            "paused": request.paused,
+            "has_active_stream": pub["producer_status"] in {"running", "paused", "starting"},
+            "session": pub,
+        }
 
 
 def _iso_utc(val: Any) -> str:
@@ -861,32 +1009,62 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
     # replay's offset so replaying an earlier segment is visible immediately.
     replay_bounds: tuple[datetime, datetime] | None = None
     replay_created_after: datetime | None = None
+    session_snapshot: dict[str, Any] | None = None
     with sessions_lock:
         current_session = sessions.get(subject_id)
         if current_session and not current_session.get("is_demo"):
-            offset = float(current_session.get("start_offset_seconds", 0))
-            duration = float(current_session.get("duration_seconds", 0))
-            created_at = current_session.get("created_at")
+            session_snapshot = dict(current_session)
+
+    if session_snapshot is not None:
+        offset = float(session_snapshot.get("start_offset_seconds", 0))
+        duration = float(session_snapshot.get("duration_seconds", 0))
+        db_started_at = session_snapshot.get("db_started_at")
+        if isinstance(db_started_at, datetime):
+            replay_created_after = db_started_at
+        else:
+            created_at = session_snapshot.get("created_at")
             if created_at:
                 replay_created_after = datetime.fromisoformat(
                     str(created_at).replace("Z", "+00:00")
+                ) - timedelta(seconds=30)
+        cached_origin = session_snapshot.get("origin_epoch")
+        if cached_origin is None and session_snapshot.get("launching"):
+            # Worker thread is still reading the ~850 MB pickle file; return fast instead of blocking HTTP
+            return {
+                "mode": "live_stack",
+                "subject_id": subject_id,
+                "summary": _build_clinical_summary([], []),
+                "predictions": [],
+                "spark_series": [],
+            }
+        subject_dir = DATA_ROOT / subject_id
+        if duration > 0 and (subject_dir / f"{subject_id}.pkl").is_file():
+            try:
+                origin_epoch = (
+                    float(cached_origin)
+                    if cached_origin is not None
+                    else pickle_wrist_origin_epoch(subject_dir)
                 )
-            subject_dir = DATA_ROOT / subject_id
-            if duration > 0 and (subject_dir / f"{subject_id}.pkl").is_file():
-                try:
-                    origin_epoch = pickle_wrist_origin_epoch(subject_dir)
-                    replay_start = datetime.fromtimestamp(
-                        origin_epoch + offset, timezone.utc
-                    )
-                    replay_bounds = (replay_start, replay_start + timedelta(seconds=duration))
-                except (OSError, ValueError, KeyError, StopIteration) as error:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            "Không căn được timeline pickle với BVP.csv; "
-                            "từ chối hiển thị dữ liệu của lần replay khác."
-                        ),
-                    ) from error
+                with sessions_lock:
+                    live_sess = sessions.get(subject_id)
+                    if live_sess is not None:
+                        live_sess["origin_epoch"] = origin_epoch
+                replay_start = datetime.fromtimestamp(
+                    origin_epoch + offset, timezone.utc
+                )
+                # Pad -15s / +30s so Edge's floor_to_10s(event_time) Window #0 and final window are never clipped
+                replay_bounds = (
+                    replay_start - timedelta(seconds=15),
+                    replay_start + timedelta(seconds=duration + 30),
+                )
+            except (OSError, ValueError, KeyError, StopIteration) as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Không căn được timeline pickle với BVP.csv; "
+                        "từ chối hiển thị dữ liệu của lần replay khác."
+                    ),
+                ) from error
 
     try:
         with db_connect() as connection:
@@ -932,31 +1110,59 @@ def device_timeline(subject_id: str, limit: int = 24) -> dict[str, Any]:
             else:
                 pred_rows = connection.execute(
                     """
+                    WITH newest AS (
+                        SELECT window_start, created_at
+                        FROM stress_predictions
+                        WHERE subject_id = %s
+                        ORDER BY created_at DESC, window_start DESC
+                        LIMIT 1
+                    )
                     SELECT p.subject_id, p.window_start, p.window_end, p.prediction,
                            p.model_score_stress, p.model_file, p.model_version,
                            p.sample_counts, p.vitals,
                            f.verdict AS feedback_verdict, f.note AS feedback_note
                     FROM stress_predictions p
+                    JOIN newest nw
+                      ON p.window_start BETWEEN nw.window_start - INTERVAL '180 seconds'
+                                            AND nw.window_start
+                     AND p.created_at >= nw.created_at - INTERVAL '15 seconds'
                     LEFT JOIN prediction_feedback f
                       ON f.subject_id = p.subject_id AND f.window_start = p.window_start
                     WHERE p.subject_id = %s
                     ORDER BY p.window_start DESC
                     LIMIT %s
                     """,
-                    (subject_id, limit),
+                    (subject_id, subject_id, limit),
                 ).fetchall()
 
-                spark_raw = connection.execute(
-                    """
-                    SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
-                           sample_count, mean_value, min_value, max_value, spark_batch_id
-                    FROM sensor_window_aggregates
-                    WHERE subject_id = %s
-                    ORDER BY window_start_utc DESC
-                    LIMIT %s
-                    """,
-                    (subject_id, limit * 18),
-                ).fetchall()
+                if pred_rows:
+                    min_ws = min(r["window_start"] for r in pred_rows)
+                    max_we = max(r["window_end"] for r in pred_rows)
+                    spark_raw = connection.execute(
+                        """
+                        SELECT DISTINCT ON (window_start_utc, sensor)
+                               subject_id, window_start_utc, window_end_utc, sensor, unit,
+                               sample_count, mean_value, min_value, max_value, spark_batch_id
+                        FROM sensor_window_aggregates
+                        WHERE subject_id = %s
+                          AND window_start_utc >= %s AND window_end_utc <= %s
+                        ORDER BY window_start_utc DESC, sensor, ingested_at DESC
+                        LIMIT %s
+                        """,
+                        (subject_id, min_ws, max_we, limit * 18),
+                    ).fetchall()
+                else:
+                    spark_raw = connection.execute(
+                        """
+                        SELECT subject_id, window_start_utc, window_end_utc, sensor, unit,
+                               sample_count, mean_value, min_value, max_value, spark_batch_id
+                        FROM sensor_window_aggregates
+                        WHERE subject_id = %s
+                        ORDER BY window_start_utc DESC
+                        LIMIT %s
+                        """,
+                        (subject_id, limit * 18),
+                    ).fetchall()
     except psycopg.Error as error:
         raise HTTPException(
             status_code=503,
@@ -1090,3 +1296,607 @@ def device_logs(subject_id: str) -> dict[str, list[str]]:
             "producer": read_tail(session.get("producer_log"), 30),
             "edge": read_tail(session.get("edge_log"), 30),
         }
+
+
+@app.delete("/devices/{subject_id}/history")
+def clear_device_history(subject_id: str) -> dict[str, Any]:
+    if DEMO_MODE or subject_id in demo_predictions:
+        with sessions_lock:
+            demo_predictions.pop(subject_id, None)
+            demo_spark_rows.pop(subject_id, None)
+        return {"subject_id": subject_id, "cleared": True}
+    try:
+        with db_connect() as connection:
+            connection.execute("DELETE FROM stress_predictions WHERE subject_id = %s", (subject_id,))
+            connection.execute("DELETE FROM sensor_window_aggregates WHERE subject_id = %s", (subject_id,))
+            connection.commit()
+    except psycopg.Error as error:
+        raise HTTPException(status_code=503, detail="Could not clear history") from error
+    return {"subject_id": subject_id, "cleared": True}
+
+
+@app.get("/pipeline/telemetry")
+def pipeline_telemetry() -> dict[str, Any]:
+    """Return live health and throughput telemetry across Kafka, Spark, Edge, and PostgreSQL."""
+    with sessions_lock:
+        active_sessions = [public_session(sid, s) for sid, s in sessions.items()]
+
+    any_edge_running = any(s["edge_status"] in {"running", "starting"} for s in active_sessions)
+    any_prod_running = any(s["producer_status"] in {"running", "starting"} for s in active_sessions)
+
+    if DEMO_MODE:
+        total_preds = sum(len(v) for v in demo_predictions.values())
+        total_spark = sum(len(v) for v in demo_spark_rows.values())
+        rate = 106.0 * (30.0 if any_prod_running else 0.0)
+        return {
+            "mode": "demo_replay",
+            "services": {
+                "kafka": "healthy" if any_prod_running else "idle",
+                "spark": "healthy",
+                "edge": "healthy" if any_edge_running else "idle",
+                "postgres": "healthy",
+            },
+            "kafka_records_per_sec": round(rate, 1),
+            "spark_processed_per_sec": round(rate * 0.98, 1),
+            "spark_batch_ms": 185.0 if any_prod_running else 42.0,
+            "total_predictions": total_preds,
+            "total_spark_windows": total_spark // 5,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    pg_ok = False
+    total_preds = 0
+    total_spark = 0
+    recent_spark_ingested = False
+    try:
+        with db_connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+            pg_ok = True
+            r1 = connection.execute("SELECT COUNT(*) AS cnt FROM stress_predictions").fetchone()
+            r2 = connection.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       MAX(ingested_at) FILTER (WHERE spark_batch_id >= 0) AS latest_spark
+                FROM sensor_window_aggregates
+                """
+            ).fetchone()
+            total_preds = int((r1 or {}).get("cnt") or 0)
+            total_spark = int((r2 or {}).get("cnt") or 0)
+            latest_ing = (r2 or {}).get("latest_spark")
+            if isinstance(latest_ing, datetime):
+                recent_spark_ingested = (datetime.now(timezone.utc) - latest_ing).total_seconds() < 90
+    except psycopg.Error:
+        pg_ok = False
+
+    kafka_tcp_ok = _probe_tcp(BROKER, timeout=0.35)
+    spark_ui_ok = _probe_tcp("127.0.0.1:4040", timeout=0.30)
+
+    prom_ok = False
+    spark_prom_up: bool | None = None
+    spark_in_rate: float | None = None
+    spark_proc_rate: float | None = None
+    spark_batch_ms: float | None = None
+    try:
+        prom_resp = requests.get(
+            "http://127.0.0.1:9090/api/v1/query",
+            params={"query": '{__name__=~"wesad_spark_.*"}'},
+            timeout=0.35,
+        )
+        if prom_resp.status_code == 200:
+            results = prom_resp.json().get("data", {}).get("result", [])
+            if results:
+                prom_ok = True
+            for item in results:
+                name = item.get("metric", {}).get("__name__", "")
+                val_pair = item.get("value") or [0, "0"]
+                val = float(val_pair[1])
+                if name == "wesad_spark_stream_up":
+                    spark_prom_up = val >= 1.0
+                elif name == "wesad_spark_input_records_per_second":
+                    spark_in_rate = round(val, 1)
+                elif name == "wesad_spark_processed_records_per_second":
+                    spark_proc_rate = round(val, 1)
+                elif name == "wesad_spark_trigger_execution_ms":
+                    spark_batch_ms = round(val, 1)
+    except Exception:
+        pass
+
+    if spark_prom_up is True or spark_ui_ok:
+        spark_service_state = "healthy"
+    elif recent_spark_ingested:
+        spark_service_state = "healthy"
+    elif spark_prom_up is False:
+        spark_service_state = "down"
+    else:
+        spark_service_state = "idle"
+
+    kafka_service_state = (
+        ("healthy" if any_prod_running else "healthy")
+        if kafka_tcp_ok
+        else "down"
+    )
+
+    return {
+        "mode": "live_stack",
+        "metrics_available": prom_ok,
+        "services": {
+            "kafka": kafka_service_state,
+            "spark": spark_service_state,
+            "edge": "healthy" if any_edge_running else "idle",
+            "postgres": "healthy" if pg_ok else "down",
+        },
+        "kafka_records_per_sec": spark_in_rate if spark_in_rate is not None else 0.0,
+        "spark_processed_per_sec": spark_proc_rate if spark_proc_rate is not None else 0.0,
+        "spark_batch_ms": spark_batch_ms if spark_batch_ms is not None else 0.0,
+        "total_predictions": total_preds,
+        "total_spark_windows": total_spark // 5,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _compute_real_cohort_kpis(all_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute real bout counts, recovery time, and UTC hour distribution from stress_predictions."""
+    by_subj: dict[str, list[dict[str, Any]]] = {}
+    hour_buckets: dict[int, list[dict[str, Any]]] = {}
+
+    for r in all_rows:
+        sid = str(r["subject_id"])
+        by_subj.setdefault(sid, []).append(r)
+        ws = r["window_start"]
+        if isinstance(ws, str):
+            ws_dt = datetime.fromisoformat(ws.replace("Z", "+00:00"))
+        else:
+            ws_dt = ws
+        hour_buckets.setdefault(int(ws_dt.astimezone(timezone.utc).hour), []).append(r)
+
+    sustained_alerts = 0
+    stress_bouts = 0
+    recovery_minutes_list: list[float] = []
+
+    for _sid, rows in by_subj.items():
+        streak = 0
+        prev_end_dt: datetime | None = None
+        last_stress_end_dt: datetime | None = None
+        awaiting_recovery = False
+
+        for r in rows:
+            ws = r["window_start"]
+            we = r["window_end"]
+            ws_dt = datetime.fromisoformat(ws.replace("Z", "+00:00")) if isinstance(ws, str) else ws
+            we_dt = datetime.fromisoformat(we.replace("Z", "+00:00")) if isinstance(we, str) else we
+            is_contiguous = prev_end_dt is not None and abs((ws_dt - prev_end_dt).total_seconds()) <= 45.0
+
+            if str(r["prediction"]) == "STRESS":
+                if not is_contiguous or streak == 0:
+                    streak = 1
+                    stress_bouts += 1
+                else:
+                    streak += 1
+                    if streak == 2:
+                        sustained_alerts += 1
+                last_stress_end_dt = we_dt
+                awaiting_recovery = True
+            else:
+                if awaiting_recovery and last_stress_end_dt is not None:
+                    gap_sec = (we_dt - last_stress_end_dt).total_seconds()
+                    if 0 < gap_sec <= 900.0:
+                        recovery_minutes_list.append(gap_sec / 60.0)
+                    awaiting_recovery = False
+                streak = 0
+            prev_end_dt = we_dt
+
+    avg_rec: float | None = (
+        round(sum(recovery_minutes_list) / len(recovery_minutes_list), 1)
+        if recovery_minutes_list
+        else None
+    )
+
+    peak_hours: list[dict[str, Any]] = []
+    for hr_utc, h_rows in hour_buckets.items():
+        scores = [round(float(x.get("model_score_stress") or 0.0) * 100.0) for x in h_rows]
+        avg_sc = int(round(sum(scores) / len(scores))) if scores else 0
+        subjs_total = {str(x["subject_id"]) for x in h_rows}
+        subjs_stressed = {
+            str(x["subject_id"]) for x in h_rows if str(x.get("prediction")) == "STRESS"
+        }
+        aff_pct = int(round((len(subjs_stressed) / max(1, len(subjs_total))) * 100.0))
+        stress_wins = sum(1 for x in h_rows if str(x.get("prediction")) == "STRESS")
+        peak_hours.append(
+            {
+                "hour_range": f"{hr_utc:02d}:00 – {hr_utc:02d}:59 UTC",
+                "avg_score": avg_sc,
+                "affected_percent": aff_pct,
+                "context_note": (
+                    f"Thực đo từ PostgreSQL: {len(h_rows)} cửa sổ 30s trên {len(subjs_total)} người "
+                    f"({stress_wins} cửa sổ phân loại STRESS)."
+                ),
+            }
+        )
+    peak_hours.sort(key=lambda item: (item["avg_score"], item["affected_percent"]), reverse=True)
+
+    return {
+        "sustained_alert_count": sustained_alerts,
+        "stress_bout_count": stress_bouts,
+        "avg_recovery_minutes": avg_rec,
+        "real_peak_hours": peak_hours[:3],
+    }
+
+
+@app.get("/team/summary")
+def team_summary() -> dict[str, Any]:
+    """Return latest real prediction & vitals summary across all WESAD subjects (S2..S17)."""
+    with sessions_lock:
+        active_map = {
+            sid: public_session(sid, sess) for sid, sess in sessions.items()
+        }
+
+    if DEMO_MODE:
+        subjects_out: dict[str, Any] = {}
+        total_stress_win = 0
+        flat_demo_rows: list[dict[str, Any]] = []
+        with sessions_lock:
+            for sid, rows in demo_predictions.items():
+                if not rows:
+                    continue
+                flat_demo_rows.extend(rows)
+                tail = rows[-8:]
+                latest = tail[-1]
+                vit = latest.get("vitals") or {}
+                scores = [
+                    int(
+                        (r.get("vitals") or {}).get("stress_load")
+                        if (r.get("vitals") or {}).get("stress_load") is not None
+                        else round(float(r.get("model_score_stress") or 0) * 100)
+                    )
+                    for r in tail
+                ]
+                cells = [
+                    {
+                        "clock_utc": _iso_utc(r["window_end"])[11:19],
+                        "stress_index": scores[i],
+                        "prediction": str(r.get("prediction") or "NON_STRESS"),
+                        "activity_state": str((r.get("vitals") or {}).get("activity_state") or "RESTING"),
+                    }
+                    for i, r in enumerate(tail)
+                ]
+                total_stress_win += sum(1 for r in rows if r.get("prediction") == "STRESS")
+                sess_info = active_map.get(sid, {})
+                is_streaming = sess_info.get("producer_status") in {"running", "starting"}
+                subjects_out[sid] = {
+                    "subject_id": sid,
+                    "is_streaming": is_streaming,
+                    "latest_window_end": _iso_utc(latest["window_end"]),
+                    "prediction": latest["prediction"],
+                    "stress_index": scores[-1],
+                    "hr_bpm": vit.get("hr_bpm"),
+                    "eda_us": vit.get("eda_mean_us"),
+                    "activity_state": vit.get("activity_state") or "RESTING",
+                    "sparkline": scores,
+                    "window_cells": cells,
+                    "windows_count": len(rows),
+                }
+        kpis = _compute_real_cohort_kpis(flat_demo_rows)
+        return {
+            "mode": "demo_replay",
+            "measured_subjects_count": len(subjects_out),
+            "total_stress_windows": total_stress_win,
+            **kpis,
+            "cohort_job": dict(_cohort_state),
+            "subjects": subjects_out,
+        }
+
+    subjects_out = {}
+    total_stress_win = 0
+    all_kpi_rows: list[dict[str, Any]] = []
+    try:
+        with db_connect() as connection:
+            ranked_rows = connection.execute(
+                """
+                WITH counts AS (
+                    SELECT subject_id, COUNT(*) AS total_cnt
+                    FROM stress_predictions
+                    GROUP BY subject_id
+                ),
+                newest AS (
+                    SELECT DISTINCT ON (subject_id)
+                        subject_id, window_start AS anchor_ws, created_at AS anchor_ct
+                    FROM stress_predictions
+                    ORDER BY subject_id, created_at DESC, window_start DESC
+                ),
+                ranked AS (
+                    SELECT
+                        p.subject_id,
+                        p.window_start,
+                        p.window_end,
+                        p.prediction,
+                        p.model_score_stress,
+                        p.vitals,
+                        c.total_cnt,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY p.subject_id ORDER BY p.window_start DESC
+                        ) AS rn
+                    FROM stress_predictions p
+                    JOIN newest nw
+                      ON nw.subject_id = p.subject_id
+                     AND p.window_start BETWEEN nw.anchor_ws - INTERVAL '180 seconds'
+                                            AND nw.anchor_ws
+                     AND p.created_at >= nw.anchor_ct - INTERVAL '15 seconds'
+                    JOIN counts c ON c.subject_id = p.subject_id
+                )
+                SELECT subject_id, window_start, window_end, prediction,
+                       model_score_stress, vitals, total_cnt
+                FROM ranked
+                WHERE rn <= 8
+                ORDER BY subject_id, window_start ASC
+                """
+            ).fetchall()
+
+            spark_latest_rows = connection.execute(
+                """
+                SELECT DISTINCT ON (subject_id, sensor)
+                    subject_id, sensor, mean_value
+                FROM sensor_window_aggregates
+                WHERE sensor IN ('HR', 'EDA')
+                ORDER BY subject_id, sensor, ingested_at DESC, window_start_utc DESC
+                """
+            ).fetchall()
+
+            all_kpi_rows = connection.execute(
+                """
+                SELECT subject_id, window_start, window_end, prediction, model_score_stress
+                FROM stress_predictions
+                ORDER BY subject_id, window_start ASC
+                """
+            ).fetchall()
+            total_stress_win = sum(
+                1 for r in all_kpi_rows if str(r.get("prediction")) == "STRESS"
+            )
+    except psycopg.Error as error:
+        raise HTTPException(status_code=503, detail="Could not query team summary") from error
+
+    kpis = _compute_real_cohort_kpis(all_kpi_rows)
+    spark_fallback: dict[tuple[str, str], float] = {}
+    for srow in spark_latest_rows:
+        spark_fallback[(str(srow["subject_id"]), str(srow["sensor"]).upper())] = float(
+            srow["mean_value"]
+        )
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in ranked_rows:
+        grouped.setdefault(str(row["subject_id"]), []).append(row)
+
+    for sid, tail in grouped.items():
+        latest = tail[-1]
+        vit = latest.get("vitals") if isinstance(latest.get("vitals"), dict) else {}
+        scores = [
+            int(
+                (r.get("vitals") or {}).get("stress_load")
+                if isinstance(r.get("vitals"), dict)
+                and r["vitals"].get("stress_load") is not None
+                else round(float(r.get("model_score_stress") or 0) * 100)
+            )
+            for r in tail
+        ]
+        cells = [
+            {
+                "clock_utc": _iso_utc(r["window_end"])[11:19],
+                "stress_index": scores[i],
+                "prediction": str(r.get("prediction") or "NON_STRESS"),
+                "activity_state": str(
+                    (r.get("vitals") or {}).get("activity_state")
+                    if isinstance(r.get("vitals"), dict)
+                    else "RESTING"
+                ),
+            }
+            for i, r in enumerate(tail)
+        ]
+        hr_val = vit.get("hr_bpm")
+        if hr_val is None and (sid, "HR") in spark_fallback:
+            hr_val = round(spark_fallback[(sid, "HR")], 1)
+        eda_val = vit.get("eda_mean_us")
+        if eda_val is None and (sid, "EDA") in spark_fallback:
+            eda_val = round(spark_fallback[(sid, "EDA")], 2)
+
+        sess_info = active_map.get(sid, {})
+        is_streaming = sess_info.get("producer_status") in {"running", "starting"}
+        subjects_out[sid] = {
+            "subject_id": sid,
+            "is_streaming": is_streaming,
+            "latest_window_end": _iso_utc(latest["window_end"]),
+            "prediction": str(latest["prediction"]),
+            "stress_index": scores[-1],
+            "hr_bpm": round(float(hr_val), 1) if hr_val is not None else None,
+            "eda_us": round(float(eda_val), 2) if eda_val is not None else None,
+            "activity_state": str(vit.get("activity_state") or "RESTING"),
+            "sparkline": scores,
+            "window_cells": cells,
+            "windows_count": int(latest.get("total_cnt") or len(tail)),
+        }
+
+    return {
+        "mode": "live_stack",
+        "measured_subjects_count": len(subjects_out),
+        "total_stress_windows": total_stress_win,
+        **kpis,
+        "cohort_job": dict(_cohort_state),
+        "subjects": subjects_out,
+    }
+
+
+@app.post("/team/run-scenario")
+def run_team_scenario(request: CohortScenarioRequest) -> dict[str, Any]:
+    """Sequentially process a scenario across all 15 WESAD subjects (S2..S17) with low memory."""
+    if not DEMO_MODE and not DATA_ROOT.is_dir():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Không tìm thấy thư mục dữ liệu WESAD thật: {DATA_ROOT}",
+        )
+
+    scenario_id = _infer_scenario_id(3690, request.scenario_id)
+    run_id = uuid.uuid4().hex[:8]
+    with sessions_lock:
+        _cohort_state.update(
+            {
+                "run_id": run_id,
+                "status": "running",
+                "scenario_id": scenario_id,
+                "completed_count": 0,
+                "total_count": len(DEMO_SUBJECTS),
+                "current_subject": DEMO_SUBJECTS[0],
+                "skipped_subjects": [],
+                "error": None,
+            }
+        )
+
+    def _cohort_worker() -> None:
+        try:
+            model, model_file, model_version = _load_local_rf()
+            cache_dir = RUNTIME_DIR / "cohort_cache"
+            real_written = 0
+            skipped: list[str] = []
+
+            for idx, sid in enumerate(DEMO_SUBJECTS):
+                with sessions_lock:
+                    if _cohort_state.get("run_id") != run_id:
+                        return
+                    _cohort_state["current_subject"] = sid
+
+                if DEMO_MODE:
+                    s_rows, p_rows = generate_scenario_windows(
+                        scenario_id=scenario_id,
+                        subject_id=sid,
+                        model=model,
+                        model_file=model_file,
+                        model_version=model_version,
+                        duration_seconds=180 if scenario_id == "stress_to_recovery" else 120,
+                    )
+                    with sessions_lock:
+                        demo_spark_rows[sid] = s_rows
+                        demo_predictions[sid] = p_rows
+                        if _cohort_state.get("run_id") != run_id:
+                            return
+                        _cohort_state["completed_count"] = idx + 1
+                    time.sleep(0.08)
+                    continue
+
+                # STRICT LIVE MODE: NEVER write synthetic/mock rows to PostgreSQL!
+                subj_dir = DATA_ROOT / sid
+                has_pkl = (subj_dir / f"{sid}.pkl").is_file()
+                if not has_pkl:
+                    skipped.append(sid)
+                    with sessions_lock:
+                        _cohort_state["skipped_subjects"] = list(skipped)
+                        _cohort_state["completed_count"] = idx + 1
+                    continue
+
+                t0 = time.monotonic()
+                catalog = load_or_build_subject_catalog(subj_dir, cache_dir=cache_dir)
+                if catalog is None:
+                    skipped.append(sid)
+                    with sessions_lock:
+                        _cohort_state["skipped_subjects"] = list(skipped)
+                        _cohort_state["completed_count"] = idx + 1
+                    continue
+
+                s_rows, p_rows = build_subject_scenario_records(
+                    catalog=catalog,
+                    scenario_id=scenario_id,
+                    model=model,
+                    model_file=model_file,
+                    model_version=model_version,
+                    spark_batch_base=-1,
+                )
+                # If cached in RAM (< 30ms), add tiny 90ms pacing so UI cards ripple smoothly
+                if time.monotonic() - t0 < 0.05:
+                    time.sleep(0.09)
+
+                if p_rows:
+                    with db_connect() as connection:
+                        for pr in p_rows:
+                            connection.execute(
+                                """
+                                INSERT INTO stress_predictions (
+                                    subject_id, window_start, window_end, prediction,
+                                    model_score_stress, model_file, model_version, sample_counts, vitals
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (subject_id, window_start) DO UPDATE SET
+                                    window_end = EXCLUDED.window_end,
+                                    prediction = EXCLUDED.prediction,
+                                    model_score_stress = EXCLUDED.model_score_stress,
+                                    model_file = EXCLUDED.model_file,
+                                    model_version = EXCLUDED.model_version,
+                                    sample_counts = EXCLUDED.sample_counts,
+                                    vitals = EXCLUDED.vitals,
+                                    created_at = NOW()
+                                """,
+                                (
+                                    pr["subject_id"],
+                                    pr["window_start"],
+                                    pr["window_end"],
+                                    pr["prediction"],
+                                    pr["model_score_stress"],
+                                    pr["model_file"],
+                                    pr["model_version"],
+                                    Jsonb(pr["sample_counts"]),
+                                    Jsonb(pr["vitals"]),
+                                ),
+                            )
+                        for sr in s_rows:
+                            connection.execute(
+                                """
+                                INSERT INTO sensor_window_aggregates (
+                                    subject_id, window_start_utc, window_end_utc,
+                                    sensor, unit, sample_count,
+                                    mean_value, min_value, max_value, spark_batch_id
+                                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                """,
+                                (
+                                    sr["subject_id"],
+                                    sr["window_start_utc"],
+                                    sr["window_end_utc"],
+                                    sr["sensor"],
+                                    sr["unit"],
+                                    sr["sample_count"],
+                                    sr["mean_value"],
+                                    sr["min_value"],
+                                    sr["max_value"],
+                                    -1,
+                                ),
+                            )
+                        connection.commit()
+                    real_written += 1
+
+                    # Clear stopped single-device replay bounds so clicking this card on Tab 2 shows the new batch on Tab 1
+                    with sessions_lock:
+                        old_sess = sessions.get(sid)
+                        if old_sess and not old_sess.get("launching"):
+                            if process_state(old_sess.get("producer")) != "running":
+                                sessions.pop(sid, None)
+
+                with sessions_lock:
+                    if _cohort_state.get("run_id") != run_id:
+                        return
+                    _cohort_state["completed_count"] = idx + 1
+
+            with sessions_lock:
+                if _cohort_state.get("run_id") == run_id:
+                    if not DEMO_MODE and real_written == 0:
+                        _cohort_state["status"] = "failed"
+                        _cohort_state["error"] = (
+                            f"Không tìm thấy tệp .pkl thật nào trong {DATA_ROOT}. "
+                            "Hệ thống từ chối ghi dữ liệu mô phỏng vào PostgreSQL."
+                        )
+                    else:
+                        _cohort_state["status"] = "completed"
+                    _cohort_state["current_subject"] = None
+        except Exception as err:
+            with sessions_lock:
+                if _cohort_state.get("run_id") == run_id:
+                    _cohort_state["status"] = "failed"
+                    _cohort_state["error"] = str(err)
+
+    threading.Thread(target=_cohort_worker, daemon=True).start()
+    return dict(_cohort_state)
+
+
+

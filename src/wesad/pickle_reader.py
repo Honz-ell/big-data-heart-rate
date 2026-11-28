@@ -142,24 +142,66 @@ def calibrate_pickle_origin_epoch(
 
 
 @lru_cache(maxsize=32)
-def _cached_pickle_origin(
+def _cached_pickle_profile(
     subject_path: str, pickle_mtime_ns: int, bvp_mtime_ns: int
-) -> float:
+) -> tuple[float, bool, tuple[tuple[int, float, float, float, float, list[float] | None], ...]]:
+    from wesad.features import sensor_features
+
     subject_dir = Path(subject_path)
     with (subject_dir / f"{subject_dir.name}.pkl").open("rb") as handle:
         payload = pickle.load(handle, encoding="latin1")
     wrist = payload["signal"]["wrist"]
-    bvp = next(
-        value
+    wrist_by_name = {
+        (key.decode("latin1") if isinstance(key, bytes) else str(key)).upper(): value
         for key, value in wrist.items()
-        if (key.decode("latin1") if isinstance(key, bytes) else str(key)).upper() == "BVP"
-    )
+    }
+    bvp = wrist_by_name["BVP"]
     origin_epoch, aligned = calibrate_pickle_origin_epoch(subject_dir, np.asarray(bvp))
-    if not aligned:
-        raise ValueError(
-            f"{subject_dir.name}: không xác minh được mốc thời gian pickle với BVP.csv"
-        )
-    return origin_epoch
+
+    labels = np.asarray(payload.get("label", []), dtype=np.int32).reshape(-1)
+    acc_arr = np.asarray(wrist_by_name.get("ACC", []), dtype=np.float64)
+    bvp_arr = np.asarray(bvp, dtype=np.float64).reshape(-1)
+    eda_arr = np.asarray(wrist_by_name.get("EDA", []), dtype=np.float64).reshape(-1)
+    temp_arr = np.asarray(wrist_by_name.get("TEMP", []), dtype=np.float64).reshape(-1)
+
+    win_sec = 30
+    lbl_step = 700 * win_sec
+    acc_step = 32 * win_sec
+    bvp_step = 64 * win_sec
+    eda_step = 4 * win_sec
+    temp_step = 4 * win_sec
+
+    n_win = min(
+        labels.size // lbl_step if labels.size else 0,
+        acc_arr.shape[0] // acc_step if acc_arr.ndim == 2 else 0,
+        bvp_arr.size // bvp_step,
+        eda_arr.size // eda_step,
+        temp_arr.size // temp_step,
+    )
+
+    windows_meta: list[tuple[int, float, float, float, float, list[float] | None]] = []
+    for w in range(n_win):
+        lbl_w = labels[w * lbl_step : (w + 1) * lbl_step]
+        base_share = float(np.count_nonzero(lbl_w == 1)) / lbl_step
+        stress_share = float(np.count_nonzero(lbl_w == 2)) / lbl_step
+
+        acc_w = acc_arr[w * acc_step : (w + 1) * acc_step]
+        bvp_w = bvp_arr[w * bvp_step : (w + 1) * bvp_step]
+        eda_w = eda_arr[w * eda_step : (w + 1) * eda_step]
+        temp_w = temp_arr[w * temp_step : (w + 1) * temp_step]
+
+        f_acc = sensor_features("ACC", acc_w)
+        f_bvp = sensor_features("BVP", bvp_w)
+        f_eda = sensor_features("EDA", eda_w)
+        f_temp = sensor_features("TEMP", temp_w)
+        feats: list[float] | None = None
+        if f_acc and f_bvp and f_eda and f_temp:
+            feats = [*f_acc, *f_bvp, *f_eda, *f_temp]
+        acc_std = float(f_acc[1]) if f_acc else 0.0
+        eda_mean = float(f_eda[0]) if f_eda else 0.0
+        windows_meta.append((w * win_sec, base_share, stress_share, acc_std, eda_mean, feats))
+
+    return origin_epoch, aligned, tuple(windows_meta)
 
 
 def pickle_wrist_origin_epoch(subject_dir: Path) -> float:
@@ -168,7 +210,98 @@ def pickle_wrist_origin_epoch(subject_dir: Path) -> float:
     bvp_path = subject_dir / f"{subject_dir.name}_E4_Data" / "BVP.csv"
     pkl_mtime = pkl_path.stat().st_mtime_ns if pkl_path.is_file() else 0
     bvp_mtime = bvp_path.stat().st_mtime_ns if bvp_path.is_file() else 0
-    return _cached_pickle_origin(str(subject_dir.resolve()), pkl_mtime, bvp_mtime)
+    origin_epoch, aligned, _ = _cached_pickle_profile(
+        str(subject_dir.resolve()), pkl_mtime, bvp_mtime
+    )
+    if not aligned:
+        raise ValueError(
+            f"{subject_dir.name}: không xác minh được mốc thời gian pickle với BVP.csv"
+        )
+    return origin_epoch
+
+
+def resolve_subject_scenario_offsets(
+    subject_dir: Path, model: object | None = None
+) -> dict[str, int]:
+    """Compute true per-subject 30s-aligned offsets (in seconds) for all 4 demo scenarios."""
+    defaults = {
+        "baseline_calm": 210,
+        "tsst_acute_stress": 3690,
+        "stress_to_recovery": 4110,
+        "physical_activity_check": 2100,
+    }
+    pkl_path = subject_dir / f"{subject_dir.name}.pkl"
+    if not pkl_path.is_file():
+        return defaults
+    bvp_path = subject_dir / f"{subject_dir.name}_E4_Data" / "BVP.csv"
+    pkl_mtime = pkl_path.stat().st_mtime_ns
+    bvp_mtime = bvp_path.stat().st_mtime_ns if bvp_path.is_file() else 0
+    _, _, windows_meta = _cached_pickle_profile(
+        str(subject_dir.resolve()), pkl_mtime, bvp_mtime
+    )
+    if len(windows_meta) < 6:
+        return defaults
+
+    rf_scores = [0.0] * len(windows_meta)
+    if model is not None and hasattr(model, "predict_proba"):
+        valid_idx = [i for i, item in enumerate(windows_meta) if item[5] is not None]
+        if valid_idx:
+            try:
+                matrix = [windows_meta[i][5] for i in valid_idx]
+                probs = model.predict_proba(matrix)
+                classes = list(getattr(model, "classes_", [0, 1]))
+                s_col = classes.index(1) if 1 in classes else -1
+                for idx_pos, probs_row in zip(valid_idx, probs):
+                    rf_scores[idx_pos] = float(probs_row[s_col])
+            except Exception:
+                pass
+
+    n = len(windows_meta)
+
+    # 1. Baseline calm: pure label==1, calm ACC & low RF score
+    base_candidates = [
+        i
+        for i in range(min(3, n - 1), max(1, n - 5))
+        if windows_meta[i][1] >= 0.9 and windows_meta[min(n - 1, i + 2)][1] >= 0.8
+    ]
+    if base_candidates:
+        best_base = min(base_candidates, key=lambda i: rf_scores[i] + windows_meta[i][3] * 0.02)
+        defaults["baseline_calm"] = windows_meta[best_base][0]
+
+    # 2. TSST acute stress: pure label==2 with highest multi-window RF stress score + EDA
+    stress_indices = [i for i in range(n) if windows_meta[i][2] >= 0.8]
+    if stress_indices:
+        def _span_score(start_i: int) -> float:
+            end_i = min(n, start_i + 4)
+            span = range(start_i, end_i)
+            purity = sum(windows_meta[k][2] for k in span) / len(span)
+            mean_rf = sum(rf_scores[k] for k in span) / len(span)
+            mean_eda = sum(windows_meta[k][4] for k in span) / len(span)
+            return purity * 2.0 + mean_rf * 3.0 + min(mean_eda, 10.0) * 0.08
+
+        best_tsst = max(stress_indices, key=_span_score)
+        defaults["tsst_acute_stress"] = windows_meta[best_tsst][0]
+
+        # 3. Stress to recovery: ~90s before the end of TSST label==2 block
+        last_stress = stress_indices[-1]
+        rec_start = max(0, last_stress - 2)
+        defaults["stress_to_recovery"] = windows_meta[rec_start][0]
+
+    # 4. Physical activity check: strictly outside TSST (stress_share == 0) with highest ACC std
+    motion_candidates = [
+        i
+        for i in range(max(1, n - 4))
+        if windows_meta[i][2] == 0.0 and windows_meta[min(n - 1, i + 1)][2] == 0.0
+    ]
+    if motion_candidates:
+        best_motion = max(
+            motion_candidates,
+            key=lambda i: (windows_meta[i][3] + windows_meta[min(n - 1, i + 1)][3]) * 0.5
+            - rf_scores[i] * 2.0,
+        )
+        defaults["physical_activity_check"] = windows_meta[best_motion][0]
+
+    return defaults
 
 
 def iter_pickle_sensor_samples(

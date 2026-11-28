@@ -16,4 +16,5 @@ scripts/runtime/**
 *.pickle
 *.log
 *.crc
+*.tsbuildinfo
 .pytest_cache/
